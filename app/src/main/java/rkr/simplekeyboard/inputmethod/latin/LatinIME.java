@@ -32,7 +32,6 @@ import android.media.AudioManager;
 import android.os.Debug;
 import android.os.IBinder;
 import android.os.Message;
-import android.preference.PreferenceManager;
 import android.text.InputType;
 import android.util.Log;
 import android.util.PrintWriterPrinter;
@@ -329,7 +328,7 @@ public class LatinIME extends InputMethodService implements KeyboardActionListen
     @Override
     public void onCreate() {
         Settings.init(this);
-        DebugFlags.init(PreferenceManager.getDefaultSharedPreferences(this));
+        //DebugFlags.init(PreferenceManager.getDefaultSharedPreferences(this));
         RichInputMethodManager.init(this);
         mRichImm = RichInputMethodManager.getInstance();
         KeyboardSwitcher.init(this);

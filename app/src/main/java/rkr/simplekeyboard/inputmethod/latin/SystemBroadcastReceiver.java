@@ -19,6 +19,8 @@ package rkr.simplekeyboard.inputmethod.latin;
 import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
+import android.os.Build;
+import android.preference.PreferenceManager;
 import android.util.Log;
 
 import rkr.simplekeyboard.inputmethod.keyboard.KeyboardLayoutSet;
@@ -36,6 +38,11 @@ public final class SystemBroadcastReceiver extends BroadcastReceiver {
         if (Intent.ACTION_LOCALE_CHANGED.equals(intentAction)) {
             Log.i(TAG, "System locale changed");
             KeyboardLayoutSet.onSystemLocaleChanged();
+        }
+        if (Intent.ACTION_MY_PACKAGE_REPLACED.equals(intentAction) &&
+                Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+            Context settingsContext = context.createDeviceProtectedStorageContext();
+            settingsContext.moveSharedPreferencesFrom(context, PreferenceManager.getDefaultSharedPreferencesName(context));
         }
     }
 }

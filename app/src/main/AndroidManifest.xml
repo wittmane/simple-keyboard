@@ -37,6 +37,7 @@
         <service
             android:name=".latin.LatinIME"
             android:label="@string/english_ime_name"
+            android:directBootAware="true"
             android:permission="android.permission.BIND_INPUT_METHOD">
             <intent-filter>
                 <action android:name="android.view.InputMethod" />
@@ -58,6 +59,9 @@
         <receiver android:name=".latin.SystemBroadcastReceiver">
             <intent-filter>
                 <action android:name="android.intent.action.LOCALE_CHANGED" />
+            </intent-filter>
+            <intent-filter >
+                <action   android:name="android.intent.action.MY_PACKAGE_REPLACED" />
             </intent-filter>
         </receiver>
     </application>
