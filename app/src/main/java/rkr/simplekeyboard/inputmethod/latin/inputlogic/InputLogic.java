@@ -16,6 +16,8 @@
 
 package rkr.simplekeyboard.inputmethod.latin.inputlogic;
 
+import static rkr.simplekeyboard.inputmethod.latin.RichInputConnection.testLog;
+
 import android.os.SystemClock;
 import android.text.TextUtils;
 import android.view.KeyCharacterMap;
@@ -28,6 +30,7 @@ import rkr.simplekeyboard.inputmethod.event.Event;
 import rkr.simplekeyboard.inputmethod.event.InputTransaction;
 import rkr.simplekeyboard.inputmethod.latin.LatinIME;
 import rkr.simplekeyboard.inputmethod.latin.RichInputConnection;
+import rkr.simplekeyboard.inputmethod.latin.Subtype;
 import rkr.simplekeyboard.inputmethod.latin.common.Constants;
 import rkr.simplekeyboard.inputmethod.latin.common.StringUtils;
 import rkr.simplekeyboard.inputmethod.latin.settings.SettingsValues;
@@ -63,7 +66,16 @@ public final class InputLogic {
      *
      * Call this when input starts or restarts in some editor (typically, in onStartInputView).
      */
-    public void startInput() {
+    public void startInput(final Subtype subtype, final int newSelStart, final int newSelEnd) {
+        testLog("InputLogic", "startInput");
+        mConnection.resetState(newSelStart, newSelEnd);
+        startInput(subtype);
+    }
+
+    private void startInput(final Subtype subtype) {
+        testLog("InputLogic", "startInput");
+        //TODO: (EW) should recapitalization handling only be done initially or also just when the
+        // subtype changes?
         mRecapitalizeStatus.disable(); // Do not perform recapitalize until the cursor is moved once
         mCurrentlyPressedHardwareKeys.clear();
     }
@@ -71,8 +83,8 @@ public final class InputLogic {
     /**
      * Call this when the subtype changes.
      */
-    public void onSubtypeChanged() {
-        startInput();
+    public void onSubtypeChanged(final Subtype subtype) {
+        startInput(subtype);
     }
 
     /**
@@ -103,8 +115,35 @@ public final class InputLogic {
      * @param newSelEnd new selection end
      * @return whether the cursor has moved as a result of user interaction.
      */
-    public boolean onUpdateSelection(final int newSelStart, final int newSelEnd) {
-        resetEntireInputState(newSelStart, newSelEnd);
+    public boolean onUpdateSelection(final int oldSelStart, final int oldSelEnd,
+                                     final int newSelStart, final int newSelEnd,
+                                     final int composingSpanStart, final int composingSpanEnd) {
+        testLog("InputLogic", "onUpdateSelection oldSelStart=" + oldSelStart
+                + ", oldSelEnd=" + oldSelEnd + ", newSelStart=" + newSelStart
+                + ", newSelEnd=" + newSelEnd + ", composingSpanStart=" + composingSpanStart
+                + ", composingSpanEnd=" + composingSpanEnd);
+
+        testLog("InputLogic",
+                "onUpdateSelection expSelStart=" + mConnection.getExpectedSelectionStart()
+                        + ", newSelStart=" + newSelStart
+                        + ", expSelEnd=" + mConnection.getExpectedSelectionEnd()
+                        + ", newSelEnd=" + newSelEnd);
+        if (!mConnection.onUpdateSelection(oldSelStart, oldSelEnd, newSelStart, newSelEnd,
+                composingSpanStart, composingSpanEnd)) {
+            testLog("InputLogic", "onUpdateSelection unexpected change");
+
+            //TODO: (EW) does this always need to happen? - currently this seems to just reset
+            // caches - maybe that should already be done in mConnection.onUpdateSelection
+            // otherwise maybe this should be renamed (or wrapper method removed - only called once)
+            //TODO: this doesn't seem necessary anymore. also, this seems to cause some bug with the
+            // selection. when selecting text often the cursor dragging things don't show up and
+            // when they do and are used to change the selection, the selection is removed. it seems
+            // this is doing more than I realize. figure that out and see if that is appropriate and
+            // see if this call should just get removed.
+            // this updates the cursor position (less intelligently than onUpdateSelection already
+            // did) and it reloads the cache, which onUpdateSelection already also did
+//            resetEntireInputState(newSelStart, newSelEnd);
+        }
 
         // The cursor has been moved : we now accept to perform recapitalization
         mRecapitalizeStatus.enable();
@@ -472,19 +511,19 @@ public final class InputLogic {
         mLatinIME.launchSettings();
     }
 
-    /**
-     * Resets the whole input state to the starting state.
-     *
-     * This will clear the composing word, reset the last composed word, clear the suggestion
-     * strip and tell the input connection about it so that it can refresh its caches.
-     *
-     * @param newSelStart the new selection start, in java characters.
-     * @param newSelEnd the new selection end, in java characters.
-     */
-    // TODO: how is this different from startInput ?!
-    private void resetEntireInputState(final int newSelStart, final int newSelEnd) {
-        mConnection.resetCachesUponCursorMoveAndReturnSuccess(newSelStart, newSelEnd);
-    }
+//    /**
+//     * Resets the whole input state to the starting state.
+//     *
+//     * This will clear the composing word, reset the last composed word, clear the suggestion
+//     * strip and tell the input connection about it so that it can refresh its caches.
+//     *
+//     * @param newSelStart the new selection start, in java characters.
+//     * @param newSelEnd the new selection end, in java characters.
+//     */
+//    // TODO: how is this different from startInput ?!
+//    private void resetEntireInputState(final int newSelStart, final int newSelEnd) {
+//        mConnection.resetCachesUponCursorMoveAndReturnSuccess(newSelStart, newSelEnd);
+//    }
 
     /**
      * Sends a DOWN key event followed by an UP key event to the editor.
@@ -538,8 +577,8 @@ public final class InputLogic {
      */
     public boolean retryResetCachesAndReturnSuccess(final boolean tryResumeSuggestions,
             final int remainingTries, final LatinIME.UIHandler handler) {
-        if (!mConnection.resetCachesUponCursorMoveAndReturnSuccess(
-                mConnection.getExpectedSelectionStart(), mConnection.getExpectedSelectionEnd())) {
+        testLog("InputLogic", "retryResetCachesAndReturnSuccess: remainingTries=" + remainingTries);
+        if (!mConnection.reloadCachesForStartingInputView()) {
             if (0 < remainingTries) {
                 handler.postResetCaches(tryResumeSuggestions, remainingTries - 1);
                 return false;

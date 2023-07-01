@@ -16,6 +16,8 @@
 
 package rkr.simplekeyboard.inputmethod.latin;
 
+import static rkr.simplekeyboard.inputmethod.latin.RichInputConnection.testLogImportant;
+
 import android.app.AlertDialog;
 import android.content.BroadcastReceiver;
 import android.content.Context;
@@ -390,7 +392,7 @@ public class LatinIME extends InputMethodService implements KeyboardActionListen
 
     @Override
     public void onCurrentSubtypeChanged() {
-        mInputLogic.onSubtypeChanged();
+        mInputLogic.onSubtypeChanged(mRichImm.getCurrentSubtype());
         loadKeyboard();
     }
 
@@ -465,11 +467,14 @@ public class LatinIME extends InputMethodService implements KeyboardActionListen
             // span, so we should reset our state unconditionally, even if restarting is true.
             // We also tell the input logic about the combining rules for the current subtype, so
             // it can adjust its combiners if needed.
-            mInputLogic.startInput();
+            mInputLogic.startInput(mRichImm.getCurrentSubtype(),
+                    editorInfo.initialSelStart, editorInfo.initialSelEnd);
 
             // TODO[IL]: Can the following be moved to InputLogic#startInput?
-            if (!mInputLogic.mConnection.resetCachesUponCursorMoveAndReturnSuccess(
-                    editorInfo.initialSelStart, editorInfo.initialSelEnd)) {
+            //TODO: (EW) startInput now reloads the cache, so this does it a second time. this^
+            // might be worth doing now
+            if (!mInputLogic.mConnection.reloadCachesForStartingInputView()) {
+                testLogImportant(TAG, "onStartInputViewInternal: posting to reset caches");
                 // Sometimes, while rotating, for some reason the framework tells the app we are not
                 // connected to it and that means we can't refresh the cache. In this case, schedule
                 // a refresh later.
@@ -567,7 +572,7 @@ public class LatinIME extends InputMethodService implements KeyboardActionListen
         // view is not displayed we have no means of showing suggestions anyway, and if it is then
         // we want to show suggestions anyway.
         if (isInputViewShown()
-                && mInputLogic.onUpdateSelection(newSelStart, newSelEnd)) {
+                && mInputLogic.onUpdateSelection(oldSelStart, oldSelEnd, newSelStart, newSelEnd, composingSpanStart, composingSpanEnd)) {
             mKeyboardSwitcher.requestUpdatingShiftState(getCurrentAutoCapsState(),
                     getCurrentRecapitalizeState());
         }
