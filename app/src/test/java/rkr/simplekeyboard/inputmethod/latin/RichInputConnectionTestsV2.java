@@ -37,10 +37,12 @@ package rkr.simplekeyboard.inputmethod.latin;
 //import static org.junit.Assert.assertFalse;
 //import static org.junit.Assert.assertNotEquals;
 //import static org.junit.Assert.assertTrue;
+//import static rkr.simplekeyboard.inputmethod.latin.RichInputConnection.UPDATE_IMPACTED_SELECTION;
+//import static rkr.simplekeyboard.inputmethod.latin.RichInputConnection.UPDATE_WAS_EXPECTED;
 
 public class RichInputConnectionTestsV2 {
 //    private final ArrayList<UpdateSelectionCall> updateSelectionCalls = new ArrayList<>();
-//    private final ArrayList<Boolean> expectedUpdateSelectionCalls = new ArrayList<>();
+//    private final ArrayList<Integer> expectedUpdateSelectionCalls = new ArrayList<>();
 //    private FakeInputConnection fakeInputConnection;
 //    private RichInputConnection richInputConnection;
 //
@@ -3146,7 +3148,10 @@ public class RichInputConnectionTestsV2 {
 //        assertNotEquals(0, updateSelectionCalls.size());
 //        assertEquals(lastUpdateSelectionCall, updateSelectionCalls.get(updateSelectionCalls.size() - 1));
 //        assertNotEquals(0, expectedUpdateSelectionCalls.size());
-//        assertEquals(lastUpdateExpected, expectedUpdateSelectionCalls.get(expectedUpdateSelectionCalls.size() - 1));
+//        int updateResult = expectedUpdateSelectionCalls.get(expectedUpdateSelectionCalls.size() - 1);
+//        boolean updateImpactedSelection = (updateResult & UPDATE_IMPACTED_SELECTION) > 0;
+//        boolean updateExpected = (updateResult & UPDATE_WAS_EXPECTED) > 0;
+//        assertEquals(lastUpdateExpected, !updateImpactedSelection);
 //    }
 //
 //    private void verifyActualText(final String text, final String composingText) {
@@ -3259,13 +3264,17 @@ public class RichInputConnectionTestsV2 {
 //
 //        assertNotEquals(0, expectedUpdateSelectionCalls.size());
 //        if (isExpectedUpdate) {
-//            for (final Boolean updateExpected : expectedUpdateSelectionCalls) {
-//                assertTrue(updateExpected);
+//            for (final int updateResult : expectedUpdateSelectionCalls) {
+//                boolean updateImpactedSelection = (updateResult & UPDATE_IMPACTED_SELECTION) > 0;
+//                boolean updateExpected = (updateResult & UPDATE_WAS_EXPECTED) > 0;
+//                assertTrue(!updateImpactedSelection);
 //            }
 //        } else {
 //            boolean allExpected = true;
-//            for (final Boolean updateExpected : expectedUpdateSelectionCalls) {
-//                allExpected = allExpected && updateExpected;
+//            for (final int updateResult : expectedUpdateSelectionCalls) {
+//                boolean updateImpactedSelection = (updateResult & UPDATE_IMPACTED_SELECTION) > 0;
+//                boolean updateExpected = (updateResult & UPDATE_WAS_EXPECTED) > 0;
+//                allExpected = allExpected && !updateImpactedSelection;
 //            }
 //            assertFalse(allExpected);
 //        }
@@ -3318,7 +3327,10 @@ public class RichInputConnectionTestsV2 {
 //        assertEquals(expectedState.getCompositionEnd(), call.candidatesEnd);
 //
 //        assertEquals(1, expectedUpdateSelectionCalls.size());
-//        assertEquals(isExpectedUpdate, expectedUpdateSelectionCalls.get(0));
+//        int updateResult = expectedUpdateSelectionCalls.get(0);
+//        boolean updateImpactedSelection = (updateResult & UPDATE_IMPACTED_SELECTION) > 0;
+//        boolean updateExpected = (updateResult & UPDATE_WAS_EXPECTED) > 0;
+//        assertEquals(isExpectedUpdate, !updateImpactedSelection);
 //
 //        //TODO: is is valuable to test the text cache twice? if not, which should be kept
 //        verifyTextCache(expectedState.getText().substring(0, expectedState.getCursorStart()),

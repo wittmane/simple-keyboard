@@ -54,6 +54,8 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Timer;
+import java.util.TimerTask;
 
 import rkr.simplekeyboard.inputmethod.latin.common.Constants;
 import rkr.simplekeyboard.inputmethod.latin.common.StringUtils;
@@ -68,6 +70,7 @@ import static rkr.simplekeyboard.inputmethod.latin.EditorState.TEXT_DIFFERENT;
 import static rkr.simplekeyboard.inputmethod.latin.EditorState.TEXT_MATCHED;
 import static rkr.simplekeyboard.inputmethod.latin.EditorState.UNKNOWN_LENGTH;
 import static rkr.simplekeyboard.inputmethod.latin.EditorState.NONCHARACTER_CODEPOINT_PLACEHOLDER;
+import static rkr.simplekeyboard.inputmethod.latin.EditorState.UNKNOWN_POSITION;
 
 /**
  * Enrichment class for InputConnection to simplify interaction and add functionality.
@@ -145,6 +148,13 @@ public final class RichInputConnection {
 
     private int mBatchIndex = 0;
     private int mLastInvalidStateBatchIndex = -1;
+
+    //TODO: (EW) consider using a linked list as that may be more efficient
+    //TODO: (EW) finish transitioning to use V2
+    private final ArrayList<SelectionPositionState> mStateHistory = new ArrayList<>();
+    private final ArrayList<SelectionPositionStateV2> mStateHistoryV2 = new ArrayList<>();
+    private final ArrayList<Long> mLastUpdateDelays = new ArrayList<>();
+    private static final int UPDATE_DELAYS_TRACK_COUNT = 20;
 
     public RichInputConnection(final InputMethodService parent) {
         mParent = parent;
@@ -331,26 +341,151 @@ public final class RichInputConnection {
         if (DEBUG_BATCH_NESTING) checkBatchEdit();
     }
 
+    // trying to type intelligently fast I managed to get as low as 99 ms between an action, but
+    // only a couple got under 150 ms and most were 200-400 ms
+    //
+    // onUpdateSelection got called as fast as 9 ms in one case and as slow as 36 ms in one case
+    // from some brief testing
+    //
+    // this means that in most reasonably performing and realistic usage, the updates for each call
+    // should be received well before we try to do the next action. it might be good to keep track
+    // of how fast we're getting these updates. if we see we're getting them slower than normal, we
+    // might want to change how some of our timer or excessive calls work to avoid lagging the
+    // system worse.
+    // in a normal (non-laggy) case we probably could check for missing updates before each action
+    // to ensure things are up-to-date before trying to make a change to ensure we request the right
+    // thing. we could also have a timer that resets after every action for ~250 ms to check for
+    // missing updates in cases that the user pauses the actions so that the UI will update
+    // appropriately, so that the next action the user takes is certain to do what it looks like it
+    // should do.
+    // in a laggy system we could up that timer to 1 or 2 seconds (probably 5 at the most), and to
+    // avoid extra lag, possibly it should skip the check between quick actions to keep actions
+    // smooth. if we're getting out-of-date actions, we probably are probably losing the composition
+    // state, so looking for missing updates at each action probably won't fix that. InputLogic will
+    // have to manage its own cache of the composition and keep working off of that.
+    //TODO: (EW) figure out when InputLogic should be taking updates to its cache so it doesn't try
+    // at times where the cache here could be incorrect
+    //
+    // ideally, I'd like the managing of the perception of the lag and response to it be in
+    // RichInputConnection since that already has some code around it, and it seems like a weird
+    // thing to expose.
+    //
+    // InputLogic should update from RichInputMethod's state only after an update (ideally both
+    // selection and extracted text if we can track both correctly) that is believed to be
+    // up-to-date or after the timer triggers to check on potentially lost updates (ie when we no
+    // longer have an expectation that we may get more updates (other than from future or external
+    // actions)). until then, it can work off of its own cache that it only updates from the actions
+    // it's requesting. for actions that aren't modified (or interspersed with external actions),
+    // using its own cache is equivalent to updating with the working state of RichInputConnection's
+    // cache at each out-of-date update, so waiting doesn't matter since the state wil already
+    // match. when getting unexpected out-of-date updates, most of the time the composition will
+    // fall into an unknown state since that could be affected by whatever made the unexpected
+    // changes, so if InputLogic tried to update its cache, it would have to finish composing and
+    // start again with the next key to avoid making various assumptions about the state, which
+    // could lead to actions the user wouldn't expect. forcing the composition to drop could make it
+    // impossible to compose some things right on a laggy system without the user being forced to
+    // wait a while for things to process before pressing the next key. ignoring the out-of-date
+    // updates seems like a better option, so any additional composing of text works off of the
+    // previous request we made. that's actually how most IMEs seem to always work. it makes the IME
+    // fight with changes from the editor, which isn't great, but it seems less likely to frustrate
+    // the user. any weird behavior from this fighting will probably be seen as an issue with the
+    // editor, rather than the IME (which would be the case if we kept dropping the composition). it
+    // still makes an assumption about the state (that what was requested is actually what happened
+    // and only what happened), which is actually always wrong since we identified an unexpected
+    // update, but it's at least consistent in its behavior, so even if it is unexpected to the
+    // user, it shouldn't be too upsetting in most cases since it's just working off of what actions
+    // were requested in the IME.
+    //TODO: (EW) add the timer (probably dynamically set the time based on the last 10 expected
+    // updates' delay) and call the handler after receiving updates or checking for missing updates
+    // (and updating based on the last update if it seems no more updates are coming)
+
+    public interface UpdatesReceivedHandler {
+        void onAllUpdatesReceived();
+    }
+    private UpdatesReceivedHandler mUpdatesReceivedHandler;
+    public void setUpdatesReceivedHandler(final UpdatesReceivedHandler handler) {
+        mUpdatesReceivedHandler = handler;
+    }
+
     public void endBatchEdit() {
         if (DEBUG_PREVIOUS_TEXT) checkConsistencyForDebug();
         if (mNestLevel <= 0) Log.e(TAG, "Batch edit not in progress!"); // TODO: exception instead
         if (--mNestLevel == 0 && isConnected()) {
+            prepSendAction();
             mIC.endBatchEdit();
         }
         testLog(TAG, "after endBatchEdit");
     }
 
+    //TODO: (EW) find a better way to ensure the state history updates any time we request a change
+    // in the text/cursor position
+    private void prepSendAction() {
+        if (mNestLevel <= 0) {
+            InternalActionEndState lastAction = getLastInternalActionState();
+            InternalActionEndState currentAction = new InternalActionEndState(mState,
+                    mRequestedExtractedTextMonitor);
+            // if there were no previous updates or actions, whatever this action is will probably
+            // change the selection or composition
+            boolean expectSelectionUpdate = true;
+            SelectionPositionStateV2 lastAction2 = getLastInternalActionState2();
+            for (int i = mStateHistoryV2.size() - 1; i >= 0; i--) {
+                SelectionPositionStateV2 state = mStateHistoryV2.get(i);
+                if (!state.isInternalAction() && !state.isSelectionUpdate()) {
+                    continue;
+                }
+                if (state.selectionStart == mState.getSelectionStart()
+                        && state.selectionEnd == mState.getSelectionEnd()) {
+                    if (mState.isCompositionUnknown()
+                            || (mState.hasComposition() && mState.isAbsoluteSelectionStartKnown())
+                            || state.compositionStart == null || state.compositionEnd == null) {
+                        // unsure about the composition either before or after the change, so it
+                        // might not actually have a change in the composition, but we'll make the
+                        // assumption that there is a change because most actions should result in a
+                        // change, and if this is wrong, either we'll end up polling for an update
+                        // that we think is missing (unnecessary IPC) or the next update will be
+                        // flagged as unexpected and probably end up also needing to poll to make
+                        // sure we got everything.
+                        //TODO: (EW) consider flagging as unsure (maybe null) to try allowing a
+                        // fallback expected update
+                        expectSelectionUpdate = true;
+                    } else {
+                        expectSelectionUpdate =
+                                state.compositionStart != mState.getCompositionStart()
+                                        || state.compositionEnd != mState.getCompositionEnd();
+                    }
+                } else {
+                    expectSelectionUpdate = true;
+                }
+                break;
+            }
+            SelectionPositionStateV2 currentAction2 = SelectionPositionStateV2.internalAction(mState,
+                    expectSelectionUpdate,
+                    mRequestedExtractedTextMonitor);
+            mStateHistory.add(currentAction);
+            mStateHistoryV2.add(currentAction2);
+            if (lastAction != null) {
+                testLog(TAG, "last action was " + (currentAction.actionTime - lastAction.actionTime)
+                        + " ms ago");
+            }
+        }
+    }
+
     public void resetState(final int newSelStart, final int newSelEnd) {
         testLog(TAG, "resetState(" + newSelStart + ", " + newSelEnd + ")");
         mState.reset();
+        mStateHistory.clear();
+        mStateHistoryV2.clear();
         if (newSelStart >= 0 && newSelEnd >= 0) {
             mState.setSelection(newSelStart, newSelEnd);
+            mStateHistory.add(new ReloadedSelectionPositionState(newSelStart, newSelEnd));
+            mStateHistoryV2.add(SelectionPositionStateV2.reloadedSelection(newSelStart, newSelEnd));
         } else {
             mState.invalidateSelection(true, true);
             mState.invalidateComposition(false);
             mState.invalidateTextCache();
         }
         mIC = mParent.getCurrentInputConnection();
+        testLog(TAG, "resetState: final: " + mState.getDebugStateInternal());
     }
 
     /**
@@ -374,6 +509,10 @@ public final class RichInputConnection {
             Log.d(TAG, "Will try to retrieve text later.");
             return false;
         }
+        mStateHistory.add(new ReloadedSelectionPositionState(
+                mState.getSelectionStart(), mState.getSelectionEnd()));
+        mStateHistoryV2.add(SelectionPositionStateV2.reloadedSelection(
+                mState.getSelectionStart(), mState.getSelectionEnd()));
         return true;
     }
 
@@ -395,6 +534,7 @@ public final class RichInputConnection {
         mState.finishComposingText();
         testLog(TAG, "finishComposingText: final " + mState.getDebugState());
         if (isConnected()) {
+            prepSendAction();
             mIC.finishComposingText();
         }
     }
@@ -421,6 +561,7 @@ public final class RichInputConnection {
                 tempBatch = true;
             }
             mState.setComposingText(text, newCursorPosition);
+            prepSendAction();
             mIC.setComposingText(text, newCursorPosition);
             if (!mState.hasCachedTextRightBeforeCursor()) {
                 // this will also request the extracted text monitor if necessary
@@ -538,6 +679,7 @@ public final class RichInputConnection {
             }
             mState.setComposingText(text, newCursorPosition);
             mState.finishComposingText();
+            prepSendAction();
             mIC.commitText(mTempObjectForCommitText, newCursorPosition);
             if (!mState.hasCachedTextRightBeforeCursor()) {
                 // this will also request the extracted text monitor if necessary
@@ -621,7 +763,7 @@ public final class RichInputConnection {
     }
 
     public CharSequence getTextAfterCursor(final int n, final int flags) {
-        return getTextAroundCursor(1, n + 1, flags, true, false, false, true).requestedText;
+        return getTextAroundCursor(1, n < Integer.MAX_VALUE ? n + 1 : Integer.MAX_VALUE, flags, true, false, false, true).requestedText;
     }
 
     //TODO: (EW) there should be a better distinction between an unknown composition text and no
@@ -1425,6 +1567,8 @@ public final class RichInputConnection {
             }
             // build a string with the proper length with placeholder characters to simplify
             // concatenating the various pieces
+            //TODO: (EW) maybe don't do this. when requesting Integer.MAX_VALUE characters, this
+            // runs out of memory.
             sb.append(EditorState.repeatChar(NONCHARACTER_CODEPOINT_PLACEHOLDER, length));
             // find the relevant pieces and add the text to the proper place in the result string
             for (TextInfo textInfo : mTextInfoList) {
@@ -1578,7 +1722,13 @@ public final class RichInputConnection {
             testLog(TAG, "loadTextCache: mIC == null");
             return false;
         }
-        testLog(TAG, "loadTextCache: init " + mState.getDebugState());
+        LoadAndValidateCacheResult result = loadAndValidateCache(loadComposition, loadSelectionPosition);
+        return (result.updateFlags & TEXT_LOADED) > 0;
+    }
+
+    private LoadAndValidateCacheResult loadAndValidateCache(final boolean loadComposition,
+                                                            final boolean loadSelectionPosition) {
+        testLog(TAG, "loadAndValidateCache: init " + mState.getDebugState());
         int textToLoadBeforeCursor = Constants.EDITOR_CONTENTS_CACHE_SIZE;
         //TODO: (EW) should we allow requesting more than the constant for the composition?
         // does the previous logic actually limit the cached text, or is it just for the initial
@@ -1605,8 +1755,7 @@ public final class RichInputConnection {
         } else {
             end = 0;
         }
-        return (loadAndValidateCache(-textToLoadBeforeCursor, end, loadSelectionPosition)
-                .updateFlags & TEXT_LOADED) > 0;
+        return loadAndValidateCache(-textToLoadBeforeCursor, end, loadSelectionPosition);
     }
     //#endregion
 
@@ -1701,8 +1850,11 @@ public final class RichInputConnection {
         // currently this is only used for recapitalization (for some reason it sets the selection
         // to a single point shortly before calling this (recently updated), but it probably would
         // work if this was just replaceSelectedText)
+        prepSendAction();
         mIC.setComposingRegion(startPosition, endPosition);
+        prepSendAction();
         mIC.setComposingText(text, 1);
+        prepSendAction();
         mIC.finishComposingText();
     }
 
@@ -1824,6 +1976,7 @@ public final class RichInputConnection {
             }
         }
         if (isConnected()) {
+            prepSendAction();
             mIC.sendKeyEvent(keyEvent);
         }
     }
@@ -1849,6 +2002,7 @@ public final class RichInputConnection {
 
         mState.setSelection(start, end);
         if (isConnected()) {
+            prepSendAction();
             final boolean isIcValid = mIC.setSelection(start, end);
             if (!isIcValid) {
                 return;
@@ -1860,16 +2014,562 @@ public final class RichInputConnection {
         }
     }
 
-    //TODO: (EW) we might want to track updates we get and expect to get. tracking updates we get
-    // could help avoiding extra IPC calls if we already checked for the other of the pair. also if
-    // we track what we expect to get, we could have a better idea if something is out-of-date or a
-    // legitimate unexpected change (and maybe could track how delayed the updates are).
-    // additionally, we could track the absence of updates, particularly in the case of trying to
-    // enter a character that gets ignored since that doesn't seem to send any update in the
-    // framework editor.
-    public boolean onUpdateSelection(int oldSelStart, int oldSelEnd,
-                                     int newSelStart, int newSelEnd,
-                                     final int composingSpanStart, final int composingSpanEnd) {
+    private InternalActionEndState getLastInternalActionState() {
+        for (int i = mStateHistory.size() - 1; i >= 0; i--) {
+            if (mStateHistory.get(i) instanceof InternalActionEndState) {
+                return (InternalActionEndState) mStateHistory.get(i);
+            }
+        }
+        return null;
+    }
+    private SelectionPositionStateV2 getLastInternalActionState2() {
+        for (int i = mStateHistoryV2.size() - 1; i >= 0; i--) {
+            if (mStateHistoryV2.get(i).isInternalAction()) {
+                return mStateHistoryV2.get(i);
+            }
+        }
+        return null;
+    }
+
+    private static class UpdateExpectation {
+        private final boolean lookingForSelectionUpdates;
+        private final boolean lookingForExtractedTextUpdates;
+        private final SelectionPositionState lastSelectionUpdate;
+        private final SelectionPositionState lastExtractedTextUpdate;
+        private final SelectionPositionState lastUpdate;
+        private final SelectionPositionState nextExpectedSelectionUpdate;
+        private final SelectionPositionState nextExpectedExtractedTextUpdate;
+        private final int actionsWaitingForSelectionUpdates;
+        private final int actionsWaitingForExtractedTextUpdates;
+        public UpdateExpectation(boolean lookingForSelectionUpdates,
+                                 boolean lookingForExtractedTextUpdates,
+                                 SelectionPositionState lastSelectionUpdate,
+                                 SelectionPositionState lastExtractedTextUpdate,
+                                 SelectionPositionState lastUpdate,
+                                 SelectionPositionState nextExpectedSelectionUpdate,
+                                 SelectionPositionState nextExpectedExtractedTextUpdate,
+                                 int actionsWaitingForSelectionUpdates,
+                                 int actionsWaitingForExtractedTextUpdates) {
+            this.lookingForSelectionUpdates = lookingForSelectionUpdates;
+            this.lookingForExtractedTextUpdates = lookingForExtractedTextUpdates;
+            this.lastSelectionUpdate = lastSelectionUpdate;
+            this.lastExtractedTextUpdate = lastExtractedTextUpdate;
+            this.lastUpdate = lastUpdate;
+            this.nextExpectedSelectionUpdate = nextExpectedSelectionUpdate;
+            this.nextExpectedExtractedTextUpdate = nextExpectedExtractedTextUpdate;
+            this.actionsWaitingForSelectionUpdates = actionsWaitingForSelectionUpdates;
+            this.actionsWaitingForExtractedTextUpdates = actionsWaitingForExtractedTextUpdates;
+        }
+    }
+
+    private static class UpdateExpectationV2 {
+        private final boolean lookingForSelectionUpdates;
+        private final boolean lookingForExtractedTextUpdates;
+        private final SelectionPositionStateV2 lastSelectionUpdate;
+        private final SelectionPositionStateV2 lastExtractedTextUpdate;
+        private final SelectionPositionStateV2 lastUpdate;
+        private final SelectionPositionStateV2 nextExpectedSelectionUpdate;
+        private final SelectionPositionStateV2 nextExpectedExtractedTextUpdate;
+        private final int actionsWaitingForSelectionUpdates;
+        private final int actionsWaitingForExtractedTextUpdates;
+        public UpdateExpectationV2(boolean lookingForSelectionUpdates,
+                                 boolean lookingForExtractedTextUpdates,
+                                 SelectionPositionStateV2 lastSelectionUpdate,
+                                 SelectionPositionStateV2 lastExtractedTextUpdate,
+                                 SelectionPositionStateV2 lastUpdate,
+                                 SelectionPositionStateV2 nextExpectedSelectionUpdate,
+                                 SelectionPositionStateV2 nextExpectedExtractedTextUpdate,
+                                 int actionsWaitingForSelectionUpdates,
+                                 int actionsWaitingForExtractedTextUpdates) {
+            this.lookingForSelectionUpdates = lookingForSelectionUpdates;
+            this.lookingForExtractedTextUpdates = lookingForExtractedTextUpdates;
+            this.lastSelectionUpdate = lastSelectionUpdate;
+            this.lastExtractedTextUpdate = lastExtractedTextUpdate;
+            this.lastUpdate = lastUpdate;
+            this.nextExpectedSelectionUpdate = nextExpectedSelectionUpdate;
+            this.nextExpectedExtractedTextUpdate = nextExpectedExtractedTextUpdate;
+            this.actionsWaitingForSelectionUpdates = actionsWaitingForSelectionUpdates;
+            this.actionsWaitingForExtractedTextUpdates = actionsWaitingForExtractedTextUpdates;
+        }
+    }
+
+    private UpdateExpectation getUpdateExpectation() {
+        for (int i = mStateHistory.size() - 1; i >= 0; i--) {
+            SelectionPositionState state = mStateHistory.get(i);
+            testLog(TAG, "getUpdateExpectation: mStateHistory[" + i + "]=" + state);
+        }
+        // track the smallest index that is needed and so everything earlier than it can be cleared
+        // at the end
+        int minIndex = mStateHistory.size() - 1;
+
+        // we only should look at internal actions after the last onUpdateSelection or
+        // onUpdateExtractedText call in the history for specific values of a update to expect.
+        // expected update calls will update the InternalActionEndState, so everything after is
+        // simply what we didn't get updates for yet, and unexpected update calls add an entry at
+        // the end, and an unexpected change (either external action or modified action) will likely
+        // impact any subsequent actions that we already sent and are waiting for updates for, so we
+        // shouldn't expect those exact updates that we originally requested.
+        int nextPotentialExpectedSelectionUpdateIndex = -1;
+        int nextPotentialExpectedExtractedTextUpdateIndex = -1;
+        int actionsWaitingForSelectionUpdates = 0;
+        int actionsWaitingForExtractedTextUpdates = 0;
+        int lastUpdateSelectionCallIndex = -1;
+        int lastUpdateExtractedTextCallIndex = -1;
+        for (int i = mStateHistory.size() - 1; i >= 0; i--) {
+            // since there may not be any extracted text notifications, we shouldn't count running
+            // through the whole history to verify that so we can still clear old entries
+            if (lastUpdateSelectionCallIndex == -1 && i < minIndex) {
+                minIndex = i;
+            }
+            SelectionPositionState state = mStateHistory.get(i);
+            if (state instanceof InternalActionEndState) {
+                InternalActionEndState internalActionEndState = (InternalActionEndState) state;
+                if (lastUpdateSelectionCallIndex == -1) {
+                    if (internalActionEndState.selectionUpdateTime > 0) {
+                        lastUpdateSelectionCallIndex = i;
+                    } else if (lastUpdateExtractedTextCallIndex == -1
+                            || lastUpdateExtractedTextCallIndex <= i) {
+                        // the next onUpdateSelection should be from either the same action that we
+                        // got the last onUpdateExtractedText from or from a more recent action
+                        // (either we already got the matching onUpdateSelection call or it isn't
+                        // going to come due to no change). we shouldn't expect an older update to
+                        // come in after receiving a more recent one.
+                        nextPotentialExpectedSelectionUpdateIndex = i;
+                        actionsWaitingForSelectionUpdates++;
+                    }
+                }
+                if (lastUpdateExtractedTextCallIndex == -1) {
+                    if (internalActionEndState.extractedTextUpdateTime > 0) {
+                        lastUpdateExtractedTextCallIndex = i;
+                        if (i < minIndex) {
+                            minIndex = i;
+                        }
+                    } else if (internalActionEndState.expectExtractedTextUpdate
+                            && (lastUpdateSelectionCallIndex == -1
+                                    || lastUpdateSelectionCallIndex <= i)) {
+                        // the next onUpdateExtractedText should be from either the same action that
+                        // we got the last onUpdateSelection from or from a more recent action
+                        // (either we already got the matching onUpdateExtractedText call or it
+                        // isn't going to come due to no change). we shouldn't expect an older
+                        // update to come in after receiving a more recent one.
+                        nextPotentialExpectedExtractedTextUpdateIndex = i;
+                        actionsWaitingForExtractedTextUpdates++;
+                    }
+                }
+            } else if (lastUpdateSelectionCallIndex == -1
+                    && state instanceof SelectionUpdateState) {
+                lastUpdateSelectionCallIndex = i;
+                //TODO: (EW) we potentially could use a SelectionUpdateState as the expectation for the next
+            } else if (lastUpdateExtractedTextCallIndex == -1
+                    && state instanceof ExtractedTextUpdateState) {
+                lastUpdateExtractedTextCallIndex = i;
+                if (i < minIndex) {
+                    minIndex = i;
+                }
+            }
+            if (lastUpdateSelectionCallIndex >= 0 && lastUpdateExtractedTextCallIndex >= 0) {
+                break;
+            }
+        }
+        SelectionPositionState lastSelectionUpdate = lastUpdateSelectionCallIndex >= 0
+                ? mStateHistory.get(lastUpdateSelectionCallIndex)
+                : null;
+        SelectionPositionState lastExtractedTextUpdate = lastUpdateExtractedTextCallIndex >= 0
+                ? mStateHistory.get(lastUpdateExtractedTextCallIndex)
+                : null;
+        SelectionPositionState lastUpdate =
+                lastUpdateSelectionCallIndex >= lastUpdateExtractedTextCallIndex
+                        ? lastSelectionUpdate
+                        : lastExtractedTextUpdate;
+
+        boolean lookingForSelectionUpdates = false;
+        SelectionPositionState nextExpectedSelectionUpdate = null;
+        if (nextPotentialExpectedSelectionUpdateIndex >= 0) {
+            // find the selection and compositions from the time of the start of the action
+            int actionStartSelectionStart = -1;
+            int actionStartSelectionEnd = -1;
+            Integer actionStartCompositionStart = null;
+            Integer actionStartCompositionEnd = null;
+            for (int i = nextPotentialExpectedSelectionUpdateIndex - 1; i >= 0; i--) {
+                if (i < minIndex) {
+                    minIndex = i;
+                }
+                SelectionPositionState state = mStateHistory.get(i);
+                if (state instanceof InternalActionEndState) {
+                    InternalActionEndState actionState = (InternalActionEndState) state;
+                    actionStartSelectionStart = actionState.selectionStart;
+                    actionStartSelectionEnd = actionState.selectionEnd;
+                    actionStartCompositionStart = actionState.compositionStart;
+                    actionStartCompositionEnd = actionState.compositionEnd;
+                    break;
+                } else if (state instanceof SelectionUpdateState) {
+                    SelectionUpdateState selectionUpdateState = (SelectionUpdateState) state;
+                    if (selectionUpdateState.appearsUpToDate != null
+                            && (boolean) selectionUpdateState.appearsUpToDate) {
+                        actionStartSelectionStart = selectionUpdateState.selectionStart;
+                        actionStartSelectionEnd = selectionUpdateState.selectionEnd;
+                        actionStartCompositionStart = selectionUpdateState.compositionStart;
+                        actionStartCompositionEnd = selectionUpdateState.compositionEnd;
+                        break;
+                    }
+                } else if (state instanceof ReloadedSelectionPositionState
+                        || state instanceof ExtractedTextUpdateState) {
+                    //TODO: (EW) we probably should use these, but we don't track composition
+                    // position with these entries
+                    actionStartSelectionStart = state.selectionStart;
+                    actionStartSelectionEnd = state.selectionEnd;
+                }
+            }
+
+            // find the next update we expect, ignoring actions that don't actually change the
+            // selection or composition positions since updates won't be sent for those
+            int nextExpectedUpdateIndex = -1;
+            for (int i = nextPotentialExpectedSelectionUpdateIndex; i >= 0 && i < mStateHistory.size(); i++) {
+                if (i < minIndex) {
+                    minIndex = i;
+                }
+                SelectionPositionState state = mStateHistory.get(i);
+                if (!(state instanceof InternalActionEndState)) {
+                    continue;
+                }
+                //TODO: (EW) consider returning an array of potential next updates. this could allow
+                // handling updates that have no net change that might be possible to receive
+                // updates for even if we normally wouldn't expect it, and it would support
+                // returning multiple options where some positions are unknown and we can't
+                // definitively say if there was a net change to be certain which update should be
+                // actually expected.
+                InternalActionEndState internalActionState = (InternalActionEndState) state;
+                if (actionStartSelectionStart != UNKNOWN_POSITION
+                        && actionStartSelectionStart == internalActionState.selectionStart
+                        && actionStartSelectionEnd != UNKNOWN_POSITION
+                        && actionStartSelectionEnd == internalActionState.selectionEnd
+                        && actionStartCompositionStart != null
+                        && internalActionState.compositionStart != null
+                        && (int) actionStartCompositionStart == internalActionState.compositionStart
+                        && actionStartCompositionEnd != null
+                        && internalActionState.compositionEnd != null
+                        && (int) actionStartCompositionEnd == internalActionState.compositionEnd) {
+                    // this action didn't have a change in the selection or composition positions,
+                    // so we wouldn't expect this update
+                    //TODO: (EW) we're not validating all of the actions, so this could be wrong. it
+                    // might actually be a better idea to have a flag on InternalActionEndState that
+                    // gets set when it is created to indicate if we expect a selection update for
+                    // it so we don't have to recalculate it here and simplify this calculation
+                    actionsWaitingForSelectionUpdates--;
+                    testLog(TAG, "getNextExpectedSelectionUpdate: ignoring action with no change: " + i);
+                    continue;
+                }
+                nextExpectedUpdateIndex = i;
+                break;
+            }
+
+            // if we found an update index, that means we requested an action with a known change
+            // (or assumed for unknown positions) after the last onUpdateSelection, so we're still
+            // waiting for that.
+            if (nextExpectedUpdateIndex >= 0) {
+                lookingForSelectionUpdates = true;
+                nextExpectedSelectionUpdate = mStateHistory.get(nextExpectedUpdateIndex);
+            }
+        }
+        // if we didn't find a specific next action we're waiting for, see if we're waiting for
+        // something based off of the last selection update. if the last update wasn't expected and
+        // we haven't fully taken the state from it (due to the chance that it was out-of-date) we
+        // should treat it as expecting an update (even if we don't know what specific update we're
+        // looking for and the lack of certainty that there actually will be another update).
+        if (!lookingForSelectionUpdates && lastSelectionUpdate instanceof SelectionUpdateState
+                && !((SelectionUpdateState)lastSelectionUpdate).updateFullyTaken) {
+            // if this update was determined to be out-of-date, we would at least have the selection
+            // positions at that time, which is a reasonable expectation of what to expect at some
+            // later point (not necessarily next, and possibly never if there was a batch going on
+            // at the time), although there is still no specific expectation of the composition
+            // position. even if we couldn't confirm that the update was out-of-date, there still
+            // is a chance that it was. also, if we got an more recent call to
+            // onUpdateExtractedText, that would be a likely case for the next selection update.
+            lookingForSelectionUpdates = true;
+            nextExpectedSelectionUpdate = null;
+            for (int i = lastUpdateSelectionCallIndex + 1; i < mStateHistory.size(); i++) {
+                if (i < minIndex) {
+                    minIndex = i;
+                }
+                SelectionPositionState state = mStateHistory.get(i);
+                if (state instanceof ReloadedSelectionPositionState
+                        || state instanceof ExtractedTextUpdateState) {
+                    nextExpectedSelectionUpdate = state;
+                    break;
+                }
+            }
+        }
+
+        boolean lookingForExtractedTextUpdates = false;
+        SelectionPositionState nextExpectedExtractedTextUpdate = null;
+        if (nextPotentialExpectedExtractedTextUpdateIndex >= 0) {
+            // currently we don't track if there were text changes, so we'll just assume that
+            // any action did change text
+            //TODO: (EW) this is blatantly wrong. cursor moves won't change text. we should
+            // either track text changes in actions or we should support returning a list of
+            // potential updates. given the lack of composition positions in the update for
+            // this, that may not be the best option. maybe just a list of 2 options would be
+            // enough for this since the next expected will keep moving to keep in line with
+            // selection updates (not expecting actions from older updates).
+            lookingForExtractedTextUpdates = true;
+            nextExpectedExtractedTextUpdate =
+                    mStateHistory.get(nextPotentialExpectedExtractedTextUpdateIndex);
+        }
+        // if we didn't find a specific next action we're waiting for, see if we're waiting for
+        // something based off of the last extracted text update. if the last update wasn't expected
+        // and it didn't seem up-to-date so we didn't take the update, we should treat it as
+        // expecting an update since we'll at least want to reload the text that we didn't take once
+        // it's safe.
+        if (!lookingForExtractedTextUpdates && lastExtractedTextUpdate instanceof ExtractedTextUpdateState
+                && (((ExtractedTextUpdateState)lastExtractedTextUpdate).appearsUpToDate == null
+                        || ((ExtractedTextUpdateState)lastExtractedTextUpdate).appearsUpToDate)) {
+            // if that update was determined to be out-of-date, we would at least have the selection
+            // positions at that time, which is a reasonable expectation of what to expect at some
+            // later point (not necessarily next, and possibly never if there was a batch going on
+            // at the time), although there is still no specific expectation of the composition
+            // position. even if we couldn't confirm that the update was out-of-date, there still is
+            // a chance that it was. also, if we got an more recent call to onUpdateSelection, that
+            // would be a likely case for the next extracted text update.
+            lookingForExtractedTextUpdates = true;
+            nextExpectedExtractedTextUpdate = null;
+            for (int i = lastUpdateSelectionCallIndex + 1; i < mStateHistory.size(); i++) {
+                if (i < minIndex) {
+                    minIndex = i;
+                }
+                SelectionPositionState state = mStateHistory.get(i);
+                if (state instanceof ReloadedSelectionPositionState
+                        || state instanceof SelectionUpdateState) {
+                    nextExpectedExtractedTextUpdate = state;
+                    break;
+                }
+            }
+        }
+
+        UpdateExpectation updateExpectation = new UpdateExpectation(
+                lookingForSelectionUpdates, lookingForExtractedTextUpdates,
+                lastSelectionUpdate, lastExtractedTextUpdate, lastUpdate,
+                nextExpectedSelectionUpdate, nextExpectedExtractedTextUpdate,
+                actionsWaitingForSelectionUpdates, actionsWaitingForExtractedTextUpdates);
+
+        // clear entries in the history that aren't relevant anymore
+        //TODO: (EW) do this more efficiently
+        while (minIndex > 0) {
+            mStateHistory.remove(minIndex - 1);
+            minIndex--;
+        }
+        testLog(TAG, "getUpdateExpectation: trimmed history to " + mStateHistory.size());
+
+        return updateExpectation;
+    }
+
+    private UpdateExpectationV2 getUpdateExpectationV2() {
+        for (int i = mStateHistoryV2.size() - 1; i >= 0; i--) {
+            testLog(TAG, "getUpdateExpectation: mStateHistory[" + i + "]=" + mStateHistoryV2.get(i));
+        }
+        // track the smallest index that is needed and so everything earlier than it can be cleared
+        // at the end
+        int minIndex = mStateHistoryV2.size() - 1;
+
+        // we only should look at internal actions after the last onUpdateSelection or
+        // onUpdateExtractedText call in the history for specific values of a update to expect.
+        // expected update calls will update the InternalActionEndState, so everything after is
+        // simply what we didn't get updates for yet, and unexpected update calls add an entry at
+        // the end, and an unexpected change (either external action or modified action) will likely
+        // impact any subsequent actions that we already sent and are waiting for updates for, so we
+        // shouldn't expect those exact updates that we originally requested.
+        int nextPotentialExpectedSelectionUpdateIndex = -1;
+        int nextPotentialExpectedExtractedTextUpdateIndex = -1;
+        int actionsWaitingForSelectionUpdates = 0;
+        int actionsWaitingForExtractedTextUpdates = 0;
+        int lastUpdateSelectionCallIndex = -1;
+        int lastUpdateExtractedTextCallIndex = -1;
+        int lastUpdateCallIndex = -1;
+        //TODO: (EW) we probably should track if there are any extracted text updates that we
+        // couldn't take the text update from to flag as needing a cache reload
+        for (int i = mStateHistoryV2.size() - 1; i >= 0; i--) {
+            // since there may not be any extracted text notifications, we shouldn't count running
+            // through the whole history to verify that so we can still clear old entries
+            if (lastUpdateSelectionCallIndex == -1 && i < minIndex) {
+                minIndex = i;
+            }
+            SelectionPositionStateV2 state = mStateHistoryV2.get(i);
+            //TODO: (EW) update to handle the new pairing better
+            if (state.isSelectionUpdate() && lastUpdateSelectionCallIndex == -1) {
+                lastUpdateSelectionCallIndex = i;
+            }
+            if (state.isExtractedTextUpdate() && lastUpdateExtractedTextCallIndex == -1) {
+                lastUpdateExtractedTextCallIndex = i;
+                if (i < minIndex) {
+                    minIndex = i;
+                }
+            }
+            lastUpdateCallIndex = Math.max(lastUpdateSelectionCallIndex,
+                    lastUpdateExtractedTextCallIndex);
+
+            // the next updates should either be for the same action (the other update) or an action
+            // after the last update that was received. we shouldn't expect an older update to come
+            // in after receiving a more recent one.
+            if (lastUpdateCallIndex <= i) {
+                // only considering internal actions because others won't have a composition
+                // position, so it never could confirm those as a matching update
+                //TODO: (EW) since the extracted update would already have been considered
+                // unexpected (being that it's its own entry), pairing up the selection update with
+                // it may be reasonably safe since we'll still be handling it largely like an
+                // unexpected update.
+                if (state.isInternalAction()
+                        && state.expectSelectionUpdate && !state.isSelectionUpdate()) {
+                    nextPotentialExpectedSelectionUpdateIndex = i;
+                    actionsWaitingForSelectionUpdates++;
+                }
+
+                if (state.expectExtractedTextUpdate && !state.isExtractedTextUpdate()) {
+                    nextPotentialExpectedExtractedTextUpdateIndex = i;
+                    actionsWaitingForExtractedTextUpdates++;
+                }
+            }
+            if (lastUpdateSelectionCallIndex >= 0 && lastUpdateExtractedTextCallIndex >= 0) {
+                break;
+            }
+        }
+        SelectionPositionStateV2 lastSelectionUpdate = lastUpdateSelectionCallIndex >= 0
+                ? mStateHistoryV2.get(lastUpdateSelectionCallIndex)
+                : null;
+        SelectionPositionStateV2 lastExtractedTextUpdate = lastUpdateExtractedTextCallIndex >= 0
+                ? mStateHistoryV2.get(lastUpdateExtractedTextCallIndex)
+                : null;
+        SelectionPositionStateV2 lastUpdate = lastUpdateCallIndex >= 0
+                ? mStateHistoryV2.get(lastUpdateCallIndex)
+                : null;
+
+        boolean lookingForSelectionUpdates = false;
+        SelectionPositionStateV2 nextExpectedSelectionUpdate = null;
+        if (nextPotentialExpectedSelectionUpdateIndex >= 0) {
+            lookingForSelectionUpdates = true;
+            //TODO: (EW) consider returning an array of potential next updates. this could allow
+            // handling updates that have no net change that might be possible to receive updates
+            // for even if we normally wouldn't expect it, and it would support returning multiple
+            // options where some positions are unknown and we can't definitively say if there was a
+            // net change to be certain which update should be actually expected.
+            nextExpectedSelectionUpdate =
+                    mStateHistoryV2.get(nextPotentialExpectedSelectionUpdateIndex);
+        }
+        // if we didn't find a specific next action we're waiting for, see if we're waiting for
+        // something based off of the last selection update. if the last update wasn't expected and
+        // we haven't fully taken the state from it (due to the chance that it was out-of-date) we
+        // should treat it as expecting an update (even if we don't know what specific update we're
+        // looking for and the lack of certainty that there actually will be another update).
+        if (!lookingForSelectionUpdates && lastSelectionUpdate != null
+                && !lastSelectionUpdate.isInternalAction()
+                && !lastSelectionUpdate.selectionUpdateFullyTaken) {
+            // if this update was determined to be out-of-date, we would at least have the selection
+            // positions at that time, which is a reasonable expectation of what to expect at some
+            // later point (not necessarily next, and possibly never if there was a batch going on
+            // at the time), although there is still no specific expectation of the composition
+            // position. even if we couldn't confirm that the update was out-of-date, there still
+            // is a chance that it was. also, if we got an more recent call to
+            // onUpdateExtractedText, that would be a likely case for the next selection update.
+            lookingForSelectionUpdates = true;
+            nextExpectedSelectionUpdate = null;
+            for (int i = lastUpdateSelectionCallIndex + 1; i < mStateHistoryV2.size(); i++) {
+                if (i < minIndex) {
+                    //TODO: (EW) can this block ever get hit?
+                    minIndex = i;
+                }
+                SelectionPositionStateV2 state = mStateHistoryV2.get(i);
+                //TODO: (EW) I think this statement is always true
+                if (!state.isInternalAction() && !state.isSelectionUpdate()) {
+                    nextExpectedSelectionUpdate = state;
+                    break;
+                }
+            }
+        }
+
+        boolean lookingForExtractedTextUpdates = false;
+        SelectionPositionStateV2 nextExpectedExtractedTextUpdate = null;
+        if (nextPotentialExpectedExtractedTextUpdateIndex >= 0) {
+            lookingForExtractedTextUpdates = true;
+            nextExpectedExtractedTextUpdate =
+                    mStateHistoryV2.get(nextPotentialExpectedExtractedTextUpdateIndex);
+        }
+        // if we didn't find a specific next action we're waiting for, see if we're waiting for
+        // something based off of the last extracted text update. if the last update wasn't expected
+        // and it didn't seem up-to-date so we didn't take the update, we should treat it as
+        // expecting an update since we'll at least want to reload the text that we didn't take once
+        // it's safe.
+        if (!lookingForExtractedTextUpdates && lastExtractedTextUpdate != null
+                && !lastExtractedTextUpdate.isInternalAction()
+                && lastExtractedTextUpdate.updateAppearsUpToDate()) {
+            // if that update was determined to be out-of-date, we would at least have the selection
+            // positions at that time, which is a reasonable expectation of what to expect at some
+            // later point (not necessarily next, and possibly never if there was a batch going on
+            // at the time), although there is still no specific expectation of the composition
+            // position. even if we couldn't confirm that the update was out-of-date, there still is
+            // a chance that it was. also, if we got an more recent call to onUpdateSelection, that
+            // would be a likely case for the next extracted text update.
+            lookingForExtractedTextUpdates = true;
+            nextExpectedExtractedTextUpdate = null;
+            for (int i = lastUpdateExtractedTextCallIndex + 1; i < mStateHistoryV2.size(); i++) {
+                if (i < minIndex) {
+                    //TODO: (EW) can this block ever get hit?
+                    minIndex = i;
+                }
+                SelectionPositionStateV2 state = mStateHistoryV2.get(i);
+                //TODO: (EW) I think this statement is always true
+                if (!state.isInternalAction() && !state.isExtractedTextUpdate()) {
+                    nextExpectedExtractedTextUpdate = state;
+                    break;
+                }
+            }
+        }
+
+        UpdateExpectationV2 updateExpectation = new UpdateExpectationV2(
+                lookingForSelectionUpdates, lookingForExtractedTextUpdates,
+                lastSelectionUpdate, lastExtractedTextUpdate, lastUpdate,
+                nextExpectedSelectionUpdate, nextExpectedExtractedTextUpdate,
+                actionsWaitingForSelectionUpdates, actionsWaitingForExtractedTextUpdates);
+
+        // clear entries in the history that aren't relevant anymore
+        //TODO: (EW) do this more efficiently
+        while (minIndex > 0) {
+            mStateHistoryV2.remove(minIndex - 1);
+            minIndex--;
+        }
+        testLog(TAG, "getUpdateExpectation: trimmed history to " + mStateHistoryV2.size());
+
+        return updateExpectation;
+    }
+
+    public final static int UPDATE_DID_NOT_IMPACT_SELECTION = 0;
+    public final static int UPDATE_IMPACTED_SELECTION = 1;
+    public final static int UPDATE_WAS_UNEXPECTED = 0;
+    public final static int UPDATE_WAS_EXPECTED = 2;
+    public final static int UPDATE_MAY_NOT_BE_CURRENT = 0;
+    public final static int UPDATE_IS_CURRENT = 4;
+
+    //TODO: (EW) track if we're expecting additional updates.
+    // if there hasn't been any unexpected updates since the last action
+    //   we're waiting for an update if that action doesn't have a matching update (eventually both)
+    //   found.
+    // if there has been an unexpected update since the last action
+    //   if the last update is marked as out-of-date, we're waiting for another update
+    //   if we couldn't check if it looked out-of-date, currently we just take the update and clear
+    //   some of the cache (but that has some risk, so it may need to be reevaluated), so it might
+    //   make sense to just say we're not waiting, although due to the risk, maybe we shouldn't call
+    //   the update handler until a delay (max expected update delay) in case it was out-of-date and
+    //   another update is coming. this could avoid some risk and just have InputLogic fall back to
+    //   ignoring unexpected updates and fight with the editor (granted that could still cause
+    //   problems if the cursor moved since that normally would drop the composition and we would
+    //   just be appending to the existing composition, but I suppose that isn't really different
+    //   than if that update just arrived late).
+    //   if we could check and it didn't look out-of-date, we could say we're not expecting
+    //   anything. we also might want to count the number of actions and compare that to the number
+    //   of updates because that could give an indication that more may be coming, but it may not be
+    //   that useful. since we can't actually check the composition position, it may actually be
+    //   better to also wait for the delay to call the handler to be extra safe.
+    // once we are tracking if we are waiting for anything, if we can see we're not waiting on
+    // anything, we can just blindly take the updates and call the handler immediately.
+    public int onUpdateSelection(int oldSelStart, int oldSelEnd, int newSelStart, int newSelEnd,
+                                 final int composingSpanStart, final int composingSpanEnd) {
         // it's possible for the text field to send an update with the selection start and end
         // positions flipped, but methods like getTextBeforeCursor still work as if the positions
         // were normal, so we should just track these in the normal position
@@ -1884,307 +2584,673 @@ public final class RichInputConnection {
             newSelEnd = newSelStart;
             newSelStart = temp;
         }
-        testLog(TAG, "onUpdateSelection: newSelStart=" + newSelStart
+        testLog(TAG, "onUpdateSelection: oldSelStart=" + oldSelStart
+                + ", oldSelEnd=" + oldSelEnd
+                + ", newSelStart=" + newSelStart
                 + ", newSelEnd=" + newSelEnd
                 + ", composingSpanStart=" + composingSpanStart
                 + ", composingSpanEnd=" + composingSpanEnd);
-        //TODO: figure out how this should be handled (or the caller) when there is no expected selection
-        //TODO: maybe only care about cursor position (still update composing position) - maybe split into two separate methods
-        //TODO: documentation states that the editor may change the length of the composing - make sure this is handled reasonably (maybe only relevant for caller)
-        boolean selectionMatches = mState.selectionMatches(newSelStart, newSelEnd, false);
-        if (selectionMatches
-                && mState.getCompositionStart() == composingSpanStart
-                && mState.getCompositionEnd() == composingSpanEnd) {
+        testLog(TAG, "onUpdateSelection: initial " + mState.getDebugStateInternal());
+
+
+        UpdateExpectation updateExpectation = getUpdateExpectation();
+        boolean wasExpected;
+        boolean takeSelectionUpdate;
+        boolean takeCompositionUpdate;
+        Boolean appearsUpToDate;
+        boolean statePositionsChanged = false;
+        ReloadedSelectionPositionState selectionReloadState = null;
+        if (positionsMatch(updateExpectation.lastSelectionUpdate,
+                newSelStart, newSelEnd, composingSpanStart, composingSpanEnd)) {
+            testLog(TAG, "onUpdateSelection: no change selection update: " + mState.getDebugState());
+            // normally we shouldn't get updates that don't have a real change in the positions, so
+            // just ignore this
+            wasExpected = true;
+            takeSelectionUpdate = false;
+            takeCompositionUpdate = false;
+            appearsUpToDate = null;
+        } else if (!updateExpectation.lookingForSelectionUpdates) {
+            testLog(TAG, "onUpdateSelection: unexpected but not waiting for updates: " + mState.getDebugState());
+            // we could try to verify if this update is up-to-date, but it isn't going to conflict
+            // with other updates that we're waiting for, so to avoid making additional IPC calls,
+            // we'll just assume it's up-to-date and take the update. even if this is out-of-date,
+            // it isn't really any different from not even getting the update yet. we don't normally
+            // verify the state before doing actions, so those cases would have the same sort of
+            // effect of working off of old data.
+            wasExpected = false;
+            takeSelectionUpdate = true;
+            takeCompositionUpdate = true;
+            appearsUpToDate = null;
+
+            // if the cursor position was already updated, this must mean onUpdateExtractedText was
+            // already called and updated that or the only change is the composition positions, so
+            // any text changes should already be accounted for, so the cache should be fine.
+            // if onUpdateExtractedText gets called after, it won't shift things in the cache (only
+            // replace text of the same length, presumably assuming that this already did that
+            // handling), so we'll need to clear anything that might no longer be correct.
+            if (mState.getSelectionStart() != newSelStart
+                    || mState.getSelectionEnd() != newSelEnd) {
+                if (oldSelStart == newSelStart) {
+                    mState.invalidateTextCacheAfterRelative(-1);
+                } else {
+                    mState.invalidateTextCache();
+                }
+            }
+        } else if (positionsMatch(updateExpectation.nextExpectedSelectionUpdate,
+                newSelStart, newSelEnd, composingSpanStart, composingSpanEnd)) {
+            testLog(TAG, "onUpdateSelection: position matches expected: " + mState.getDebugState());
+            wasExpected = true;
+            takeSelectionUpdate = false;
+            takeCompositionUpdate = false;
+            //TODO: (EW) maybe determine - currently doesn't matter
+            appearsUpToDate = null;
+
+            InternalActionEndState expectedUpdate =
+                    (InternalActionEndState) updateExpectation.nextExpectedSelectionUpdate;
+
+            expectedUpdate.selectionUpdateTime = SystemClock.uptimeMillis();
+            mLastUpdateDelays.add(
+                    expectedUpdate.selectionUpdateTime - expectedUpdate.actionTime);
+            while (mLastUpdateDelays.size() > UPDATE_DELAYS_TRACK_COUNT) {
+                mLastUpdateDelays.remove(0);
+            }
+            // even if this update is out-of-date, it matches the next update we were
+            // expecting, so we don't need to do anything from this update
+            testLog(TAG, "onUpdateSelection: update matched next expected update and took "
+                    + (expectedUpdate.selectionUpdateTime - expectedUpdate.actionTime)
+                    + " ms");
+            //TODO: (EW) probably call in all cases (at least above case)
+            if (!mRequestedExtractedTextMonitor && newSelStart == newSelEnd) {
+                // request the extracted text monitor and reload text in case text had been
+                // changed
+                loadTextCache(false);
+            }
+        } else {
+            testLog(TAG, "onUpdateSelection: update didn't match what was expected: " + updateExpectation.nextExpectedSelectionUpdate);
+            // note that expected state may have unknowns, so not matching doesn't necessarily mean
+            // this is from an external action or modification of the action we requested.
+            //TODO: (EW) should we have a carve-out if the next expected update has unknown cursor
+            // positions?
+            // it might be better to fall back to an unknown state to be safe
+            // it might be reasonably safe assuming the update is up-to-date if we currently only
+            // have 1 update that we're expecting that matches (I don't remember why I thought this
+            // would be fairly safe).
+
+            wasExpected = false;
+
+
+            // verify this update is up-to-date
+            int updateFlags = loadAndValidateCache(0, 0, true).updateFlags;
+            if ((updateFlags & SELECTION_LOADED) > 0) {
+                appearsUpToDate = mState.selectionMatches(newSelStart, newSelEnd, false);
+                testLog(TAG, "onUpdateSelection: appearsUpToDate=" + appearsUpToDate);
+                if ((updateFlags & SELECTION_UPDATED) > 0) {
+                    testLog(TAG, "onUpdateSelection: SELECTION_UPDATED");
+                    statePositionsChanged = true;
+                    selectionReloadState = new ReloadedSelectionPositionState(
+                            mState.getSelectionStart(), mState.getSelectionEnd());
+                }
+                if (appearsUpToDate) {
+                    // the update seems up-to-date as far as we can tell (validated the selection
+                    // positions). this update doesn't match an expected update, so it wouldn't be
+                    // surprising that an unexpected update wouldn't match our current state, so we'll
+                    // just take this update if there are changes to the composition
+                    //TODO: (EW) if we update InputLogic's working text when this is wrong, that
+                    // could cause problems. maybe we wait to update this until the next action
+                    // (probably from an API called before entering new text) and then pull it out
+                    // of the history so we give it more time to update with any additional
+                    // in-flight updates before the next action is triggered.
+                    //TODO: (EW) I'm not sure if this should be done, but all tests are passing.
+                    // is this always safe, or should be there some condition?
+                    takeSelectionUpdate = true;
+                    takeCompositionUpdate = true;
+                } else {
+                    takeSelectionUpdate = false;
+                    takeCompositionUpdate = false;
+                }
+            } else {
+                //TODO: (EW) how should we handle not being able to verify if an update is up-to-date?
+                // we know this is unexpected (at least conceptually - could check if it is at least
+                // different from the current state, but I'm not sure what that will show). maybe look
+                // at other things in the history, but if we couldn't get the extracted text now, we
+                // probably couldn't in other cases, so that might not show much that is needed.
+                if (!mState.isCompositionUnknown() && ((!mState.hasComposition()
+                        && (composingSpanStart == UNKNOWN_POSITION
+                        || composingSpanEnd == UNKNOWN_POSITION))
+                        || (mState.hasComposition()
+                        && mState.getCompositionStart() == composingSpanStart
+                        && mState.getCompositionEnd() == composingSpanEnd))) {
+                    testLog(TAG, "onUpdateSelection: assuming up-to-date based on matching composition");
+                    if (mState.getSelectionStart() != newSelStart || mState.getSelectionEnd() != newSelEnd) {
+                        // this update only indicates the cursor position moved. if there is a
+                        // composition, the most likely case is probably that an external action moved
+                        // the cursor. the composition position is the more critical piece to keep
+                        // accurate since composing more text will build off of it. external cursor
+                        // movements are common, and it should be safe enough to assume that this is an
+                        // up-to-date update (it isn't going to mess up actions with the composition).
+                        takeSelectionUpdate = true;
+                        takeCompositionUpdate = false;
+                    } else {
+                        takeSelectionUpdate = false;
+                        takeCompositionUpdate = false;
+                    }
+                    appearsUpToDate = true;
+                } else {
+                    //TODO: (EW) should we avoid reloading the cache now? since we couldn't validate
+                    // that the update is up-to-date, we may be wasting time loading text and putting it
+                    // in an incorrect place that could mess things up.
+                    //TODO: (EW) I'm not sure if this is relevant to do anymore - maybe just wait for the timer to update
+                    if (newSelStart != mState.getSelectionStart()) {
+                        // we don't have any way to tell if this update is up-to-date. out-of-date updates
+                        // should be fairly uncommon, so the best option is probably to just assume this
+                        // up-to-date, but also clear the rest of our state to be safe.
+                        //TODO: (EW) is clearing the state safe? if this is out-of-date, the text in the
+                        // cache will get reloaded in the wrong places.
+                        takeSelectionUpdate = true;
+                        takeCompositionUpdate = true;
+                        mState.invalidateTextCache();
+                    } else if (newSelEnd != mState.getSelectionEnd()) {
+                        // the selection start is the same, but the selection end is different. most
+                        // things work off of the selection start, so even if this is an out-of-date
+                        // update, changing the selection end shouldn't cause as much of an issue. also,
+                        // the text before the cursor should be safe to keep in either case.
+                        takeSelectionUpdate = true;
+                        takeCompositionUpdate = true;
+                        mState.invalidateTextCacheAfterRelative(-1);
+                    } else {
+                        // we don't have any way to tell if this update is up-to-date, but the selection
+                        // at least matches our expected state. out-of-date updates should be fairly
+                        // uncommon, so the best option is probably to just assume this up-to-date
+                        //TODO: (EW) do we need to invalidate any text for any of these cases?
+                        takeSelectionUpdate = true;
+                        takeCompositionUpdate = true;
+                    }
+//                    takeUpdate = false;
+//                    takeSelectionUpdate = false;
+//                    takeCompositionUpdate = false;
+                    appearsUpToDate = null;
+                }
+            }
+        }
+        testLog(TAG, "onUpdateSelection: wasExpected=" + wasExpected
+                + ", takeSelectionUpdate=" + takeSelectionUpdate
+                + ", takeCompositionUpdate=" + takeCompositionUpdate
+                + ", appearsUpToDate=" + appearsUpToDate);
+
+        if (!wasExpected) {
+            boolean expectedSelectionMatches = mState.selectionMatches(newSelStart, newSelEnd, false);
+            SelectionUpdateState workingSelectionUpdateState = new SelectionUpdateState(
+                    newSelStart, newSelEnd, composingSpanStart, composingSpanEnd, appearsUpToDate,
+                    expectedSelectionMatches, takeSelectionUpdate);
+            testLog(TAG, "onUpdateSelection: add mStateHistory entry: " + workingSelectionUpdateState);
+            mStateHistory.add(workingSelectionUpdateState);
+            // if we updated the selection from a call to check the position and that indicated that the
+            // update was out-of-date, keep track of where we updated the selection from. if we have an
+            // up-to-date update, we can see that we update from that
+            if (appearsUpToDate != null && !appearsUpToDate && selectionReloadState != null) {
+                // only need to add the entry in the history
+                mStateHistory.add(selectionReloadState);
+            }
+        }
+
+        if (takeSelectionUpdate) {
+            if (mState.getSelectionStart() != newSelStart
+                    || mState.getSelectionEnd() != newSelEnd) {
+                if (mState.getSelectionStart() != newSelStart) {
+                    mState.invalidateTextCache();
+                }
+                mState.setSelection(newSelStart, newSelEnd);
+                statePositionsChanged = true;
+            }
+        }
+        if (takeCompositionUpdate) {
+            if (composingSpanStart == UNKNOWN_POSITION || composingSpanEnd == UNKNOWN_POSITION) {
+                if (mState.isCompositionUnknown() || mState.hasComposition()) {
+                    mState.finishComposingText();
+                    statePositionsChanged = true;
+                }
+            } else {
+                if (composingSpanStart != mState.getCompositionStart()
+                        || composingSpanEnd != mState.getCompositionEnd()) {
+                    testLog(TAG, "onUpdateSelection: setComposingRegion: " + composingSpanStart + " - " + composingSpanEnd);
+                    mState.setComposingRegion(composingSpanStart, composingSpanEnd);
+                    statePositionsChanged = true;
+                }
+            }
+        }
+
+        if (appearsUpToDate != null && !appearsUpToDate) {
+            testLog(TAG, "onUpdateSelection: out-of-date update: statePositionsChanged=" + statePositionsChanged);
             if (!mRequestedExtractedTextMonitor && newSelStart == newSelEnd) {
                 // request the extracted text monitor and reload text in case text had been changed
                 loadTextCache(false);
             }
-            return true;
-        }
-        testLog(TAG, "onUpdateSelection: unexpected newSelStart="
-                + newSelStart + (mState.getSelectionStart() != newSelStart ? "!=" + mState.getSelectionStart() : "")
-                + ", newSelEnd=" + newSelEnd + (mState.getSelectionEnd() != newSelEnd ? "!=" + mState.getSelectionEnd() : "")
-                + ", composingSpanStart=" + composingSpanStart + (mState.getCompositionStart() != composingSpanStart ? "!=" + mState.getCompositionStart() : "")
-                + ", composingSpanEnd=" + composingSpanEnd + (mState.getCompositionEnd() != composingSpanEnd ? "!=" + mState.getCompositionEnd() : ""));
-
-        //TODO: (EW) compare the old selection positions. the most common unexpected update is from
-        // the user simply moving the cursor. if the old position matches our expected state, it's a
-        // good chance this is just a cursor moving by the user (especially since the framework
-        // editor calls onUpdateExtractedText before this, but that wouldn't get called if no text
-        // changed, so seeing an unexpected cursor change here likely means it wasn't from a text
-        // change). I suppose it's still possible for some weird out-of-date scenario to be able to
-        // hit this, so we might still want to validate the current cursor position. if we shift the
-        // cursor position first, we could keep cached text in the most likely scenario, and it
-        // would clear it if it ends up finding this is an out-of-date update. if we want to keep
-        // the cache in the out-of-date update scenario, we probably would need to not call into
-        // getTextAroundCursor, but still have similar logic separately for clearing the cache (I'm
-        // not sure if there would be a good way to share the code, especially since that method is
-        // complex enough).
-        if (!selectionMatches) {
-            // verify this update is up-to-date
-            int updateFlags = loadAndValidateCache(0, 0, true).updateFlags;
-            if ((updateFlags & SELECTION_LOADED) > 0) {
-                if (!mState.selectionMatches(newSelStart, newSelEnd, false)) {
-                    // this update appears to be out-of-date. sometimes if multiple things happen in
-                    // quick succession, the updates get to us late (ie: get an update for the first
-                    // action after having completed the second action), so we should just ignore
-                    // this
-                    //TODO: (EW) tests currently don't seem to cover this
-                    Log.e(TAG, "onUpdateSelection: out-of-date update: current selection start = "
-                            + mState.getSelectionStart() + ", current selection end = " + mState.getSelectionEnd());
-                    if ((updateFlags & SELECTION_CORRECTED) > 0) {
-                        // the cached state, update state, and verified state are all different.
-                        // loadAndValidateCache should have already handled clearing the caches if
-                        // necessary
-                        return false;
-                    } else {
-                        // even though the current update doesn't match the expected state, the
-                        // verified current state does match the expected state, so we'll basically
-                        // ignore this update and indicate that we're up-to-date already. note that
-                        // the composition could be wrong, but there isn't any way to check that.
-                        return true;
-                    }
-                }
-                //TODO: (EW) I'm not sure what of the rest of the logic is needed in this case, but
-                // trying to skip it with this breaks 96 (external modification) tests
-//                loadTextCache(true);
-//                return false;
-            } else if (newSelStart != mState.getSelectionStart()) {
-                // we couldn't verify whether this update is current, but an unexpected cursor
-                // change is much more likely than an out-of-date update, so we'll assume that's the
-                // case. if it is just an out-of-date update, changing the tracked selection
-                // positions could cause some unexpected behavior, but there doesn't seem to be much
-                // alternative. clearing the cache is relatively safe. at worst, we'll have to
-                // reload it and maybe won't be able to get some of it and extra IPC calls may lag
-                // things worse since the system is already running slow.
-                //TODO: (EW) we should track times for IPC calls to get a gauge of whether calls are
-                // lagging to potentially use here to avoid messing up the state. even if we know it
-                // has been lagging, we can't just ignore all updates because a very likely use case
-                // is for the user to click a different part of the text, which would give us an
-                // unexpected change.
-                // we could also try to track the previous position from the beginning of the last
-                // batch to compare to the old selection positions, but if we were already lagging,
-                // we may not have the (right) update by then. also, we could get an update from
-                // outside of our app's requests that won't fit, so this may not really work
-                // either.
-                // we could try to reload the cached text before the cursor to validate at least
-                // most of the text is accurate, but that could indicate that text was added/removed
-                // before the cached text or the update is out-of-date, so that probably doesn't
-                // really help.
-                testLog(TAG, "onUpdateSelection: invalidateTextCache - couldn't verify whether the cursor start change is current");
-                mState.invalidateTextCache();
-            } else {
-                // the selection end is different. most things work off of the selection start, so
-                // even if this is an out-of-date update, changing the selection end shouldn't cause
-                // as much of an issue. also, the text before the cursor should be safe to keep in
-                // either case.
-                mState.invalidateTextCacheAfterRelative(-1);
+        } else if (!statePositionsChanged) {
+            testLog(TAG, "onUpdateSelection: state positions didn't change, so considering expected");
+            //TODO: (EW) reduce this duplicate code
+            if (!mRequestedExtractedTextMonitor && newSelStart == newSelEnd) {
+                // request the extracted text monitor and reload text in case text had been changed
+                loadTextCache(false);
             }
-        } else {
-            // only the composition is unexpected
-            mState.setComposingRegion(composingSpanStart, composingSpanEnd);
-            // if the composition state was unknown, this may just be the update indicating the
-            // state, which means we have no reason to believe the cache is incorrect. if there was
-            // an actual unexpected change to the composition, onUpdateExtractedText either already
-            // handled invalidating any necessary part of the cache based on the change or it should
-            // get the update and do so shortly. in any case, we shouldn't need to deal with
-            // clearing anything from the cache here. still, we'll try loading the composition text
-            // in case any of it is missing.
-            getCompositionState();
-            return false;
         }
 
-        //TODO: (EW) now that we're using getTextAroundCursor (wrapped) to verify the out-of-date
-        // updates, this logic might be able to be simplified. I thought the handling of the cache
-        // would lose important things that this logic preserves, but that doesn't seem to be the
-        // case. some (most?) of it is still necessary in case extracting text isn't supported.
-        //TODO: if the composition length changes, should we clear part of the cache?
-        // if the composition is before the cursor and the cursor didn't change, I think this isn't
-        // necessary because either we already updated from onUpdateExtractedText and the cache is
-        // already correct, or it should get called after this and should be able to clean up any
-        // incorrect text in the cache
-        // if the composition is after the cursor, clearing after the composition start might be
-        // necessary
-        //TODO: if the composition position changes (unexpectedly), we should refresh the text
-        // because it might have been incorrectly updated if onUpdateExtractedText was called first
-        // or if onUpdateExtractedText wasn't and won't be called
-        //TODO: this conditional logic is reasonably complicated and there is probably a good chance
-        // for me to have missed some edge case or someone else to incorrectly change this in the
-        // future. is this really fixing much? would it be better to just clear the cache always (at
-        // least when the cursor position changes) or at least find some substantially simpler logic
-        // that clears more
-        boolean reloadComposition = false;
-        // if onUpdateExtractedText was called first, it should have handled the selection change
-        // already, so nothing would need to be done here
-        if (mState.getSelectionStart() != newSelStart) {
-            if (!mState.isAbsoluteSelectionStartKnown()) {
-                // we don't know where the cursor was before, so we can't tell if it changed to have
-                // any idea what in the cache might be valid or not, so we can't be sure it's still
-                // accurate
-                testLog(TAG, "onUpdateSelection: invalidateTextCache - no cursor position");
-                mState.invalidateTextCache();
-                // update the selection and composition now that we know them
-                mState.setSelection(newSelStart, newSelEnd);
-                mState.setComposingRegion(composingSpanStart, composingSpanEnd);
-                reloadComposition = true;
-            } else if (composingSpanStart < 0) {
-                // the cursor could have moved (need to shift the relative position of the cache) or
-                // the text before the cursor changed length (keep relative cache and trust
-                // onUpdateExtractedText to handle the text change) or both (nothing in cache can be
-                // trusted to be accurate), and there is no composition to potentially use as a
-                // reference, so we can't be sure what in the cache is still valid
-                testLog(TAG, "onUpdateSelection: invalidateTextCache - cursor start change no composition");
-                mState.invalidateTextCache();
-                // update the selection and composition since at least the cursor start was
-                // incorrect
-                mState.setSelection(newSelStart, newSelEnd);
-                mState.finishComposingText();
-                reloadComposition = true;
-            } else if (mState.getCompositionStart() == composingSpanStart) {
-                if (mState.getCompositionEnd() == composingSpanEnd) {
-                    // the composition didn't change in length or position, so we can rely on
-                    // onUpdateExtractedText to update the text if that was modified.
-                    if (mState.getSelectionStart() < composingSpanEnd) {
-                        // the cursor was before the end of the composition, which didn't change
-                        // position, which means that the cursor probably just moved, but even if it
-                        // also involved some text change, we can rely on onUpdateExtractedText to
-                        // update the text. nothing in the cache needs to be removed because there
-                        // isn't the question of whether text was inserted/removed or the cursor
-                        // moved positions
-                    } else if (newSelStart < composingSpanEnd) {
-                        // the cursor crossed over the composition, which means that the the cursor
-                        // probably simply moved, rather than shifting text at or before the cursor,
-                        // so nothing in the cache needs to be cleared. if there was also some text
-                        // change, we can rely on onUpdateExtractedText to update the cache
-                    } else {
-                        // the cursor position moved while staying somewhere after the composition,
-                        // but it isn't clear whether this is just from a cursor movement or from
-                        // text inserted/removed between the composition and cursor, so we can't be
-                        // sure what in the cache after the composition is still correct or how to
-                        // shift it to be correct. if onUpdateExtractedText gets called for this
-                        // change (text inserted/removed), it may only get the small portion that
-                        // changed, and since the cursor isn't changing (already updated here), it
-                        // will just replace whatever text in the cache in the position of the
-                        // change, but it won't clear or shift anything, so we need to clear the
-                        // part that is no longer certain to be correct here.
-                        testLog(TAG, "onUpdateSelection: invalidateTextCacheAfter "
-                                + (composingSpanEnd - 1) + " - cursor change kept after composition");
-                        mState.invalidateTextCacheAfterAbsolute(composingSpanEnd - 1);
-
-                        // it's possible (although unlikely) that some of the text before the end of
-                        // the composition also changed, but if onUpdateExtractedText is called, it
-                        // won't need to clear the cache after the update (and before the end of the
-                        // composition) because it won't see the cursor as changing and the cursor
-                        // is after the composition. this means that if there is a text change in
-                        // the text that is cached, it will be updated and it won't unexpectedly
-                        // clear the cached composition, so this much of the cache should be safe to
-                        // keep.
-                    }
-                } else {
-                    // it's unclear what's changing after the composition start, but the text before
-                    // it is probably the same, but even if some of that changed too,
-                    // onUpdateExtractedText can handle updating that
-                    testLog(TAG, "onUpdateSelection: invalidateTextCacheAfter "
-                            + (composingSpanStart - 1) + " - cursor start and composition end changed");
-                    mState.invalidateTextCacheAfterAbsolute(composingSpanStart - 1);
-                    // update for the changed composition
-                    mState.setComposingRegion(composingSpanStart, composingSpanEnd);
-                    reloadComposition = true;
-                    // since we're not keeping any of the composition, it shouldn't be unexpectedly
-                    // lost when onUpdateExtractedText is called
-                }
-                // update for the changed cursor position
-                mState.setSelection(newSelStart, newSelEnd);
-            } else {
-                if (mState.getSelectionLength() == newSelEnd - newSelStart
-                        && mState.getCompositionEnd() - mState.getCompositionStart() == composingSpanEnd - composingSpanStart
-                        && newSelStart - mState.getSelectionStart() == composingSpanStart - mState.getCompositionStart()) {
-                    // the selection length and composition length didn't change and their positions
-                    // shifted the same amount, which means that text was probably inserted/removed
-                    // before both, but there is a small chance that the composing region and
-                    // selection were changed without a text change, which would mean that
-                    // onUpdateExtractedText wouldn't get triggered with the necessary update to fix
-                    // the text, which means doing that could potentially put the cache into an
-                    // incorrect state
-                    // TODO: see if there is anything else we can do to handle this case
-                    testLog(TAG, "onUpdateSelection: invalidateTextCache  - cursor and composition shifted same");
-                    mState.invalidateTextCache();
-                    reloadComposition = true;
-                } else {
-                    testLog(TAG, "onUpdateSelection: invalidateTextCache - cursor and composition start change");
-                    mState.invalidateTextCache();
-                    reloadComposition = true;
-                }
-                // update for the changed cursor and composition positions
-                mState.setSelection(newSelStart, newSelEnd);
-                mState.setComposingRegion(composingSpanStart, composingSpanEnd);
-            }
-        } else if (mState.getSelectionEnd() != newSelEnd) {
-            // the cursor end could have moved (the cache is unaffected) or the text in the
-            // selection changed length (some of the text in the cache needs to shift) or both
-            // (nothing in cache can be trusted to be accurate). since the expected cursor position
-            // is wrong, it means that onUpdateExtractedText wasn't called yet, so we'll need to
-            // clear the cache after the cursor start since we don't know what specifically changed,
-            // and we can't rely on onUpdateExtractedText to handle it completely because it may
-            // just look like text changed in content rather than length, so it won't know how to
-            // handle the text in the cache that's after the changing text.
-            //TODO: check the composition to see if it is unchanged
-            testLog(TAG, "onUpdateSelection: invalidateTextCacheAfter "
-                    + (mState.getSelectionStart() - 1) + " - cursor end change");
-            mState.invalidateTextCacheAfterAbsolute(mState.getSelectionStart() - 1);
-            if (mState.getSelectionStart() < composingSpanEnd) {
-                reloadComposition = true;
-            }
-            // update for the changed cursor position
-            mState.setSelection(newSelStart, newSelEnd);
-            // update the composition in case that changed too
-            mState.setComposingRegion(composingSpanStart, composingSpanEnd);
-        } else {
-            // only the composition is unexpected
-            // if the composition state was unknown, this may just be the update indicating the
-            // state, which means we have no reason to believe the cache is incorrect. if there was
-            // an actual unexpected change to the composition, onUpdateExtractedText either already
-            // handled invalidating any necessary part of the cache based on the change or it should
-            // get the update and do so shortly. in any case, we shouldn't need to deal with
-            // clearing anything from the cache here. still, we'll try loading the composition text
-            // in case any of it is missing.
-            //TODO: (EW) make sure this only loads text that is missing. if the composition is
-            // already cached, we shouldn't need to load it again.
-            reloadComposition = true;
-            // update the composition since that changed (or was unknown)
-            mState.setComposingRegion(composingSpanStart, composingSpanEnd);
+        UpdateExpectation nextUpdateExpectation = getUpdateExpectation();
+        if (!nextUpdateExpectation.lookingForSelectionUpdates
+                && !nextUpdateExpectation.lookingForExtractedTextUpdates
+                && mUpdatesReceivedHandler != null) {
+            mUpdatesReceivedHandler.onAllUpdatesReceived();
         }
-        //TODO: if only the composition changed, maybe try to use the last known composition to
-        // update the main cache if it's missing
-        //TODO: alternatively, should this just clear the cache (possibly only part of it needs to
-        // be cleared) and allow it to be rebuilt later as needed
-        //TODO: particularly for the case of UPDATE_COMPOSITION_ON_UPDATE_SELECTION, make sure that
-        // if onUpdateExtractedText is called afterwards, it doesn't unexpectedly lose some of the
-        // composing text if this loads the whole composition
-        loadTextCache(reloadComposition);
-        //TODO: if we're missing some of the cached composition and the length of the composition
-        // didn't change, try updating with the last known composition
-        // the portion of the full text that is the composition probably isn't going to just change
-        // outside of the IME - if the composition moves, it's likely due to text added/removed
-        // before the composition (I think the composition theoretically could be changed from some
-        // external source, but I have no idea if that's a realistic scenario or why something would
-        // want to do this)
-        // if onUpdateExtractedText was called first the cache would already have the update
-        // if something change, and this could fill in anything that wasn't included. alternatively,
-        // we could only update the cache if what does exist matches the last known composition to
-        // make it less likely that the cache is updated incorrectly.
-        // if onUpdateExtractedText gets called after this, that should be able to fix the cache if
-        // the text changed in the new composition position in addition to the composition position,
-        // although if different text was simply selected as the new composition (as unlikely as
-        // that may be), onUpdateExtractedText probably wouldn't trigger, which would leave the
-        // cache incorrect.
+        //TODO: (EW) (re)start the timer when expecting additional updates (maybe don't have to
+        // restart if the update is just necessary from an internal action (haven't had unexpected
+        // updates yet))
         testLog(TAG, "onUpdateSelection: final " + mState.getDebugState());
+        testLog(TAG, "onUpdateSelection: statePositionsChanged=" + statePositionsChanged);
+        testLog(TAG, "onUpdateSelection: wasExpected=" + wasExpected);
+        testLog(TAG, "onUpdateSelection: lookingForSelectionUpdates="
+                + nextUpdateExpectation.lookingForSelectionUpdates);
+        return (statePositionsChanged ? UPDATE_IMPACTED_SELECTION : UPDATE_DID_NOT_IMPACT_SELECTION)
+                | (wasExpected ? UPDATE_WAS_EXPECTED : UPDATE_WAS_UNEXPECTED)
+                | (nextUpdateExpectation.lookingForSelectionUpdates
+                        ? UPDATE_MAY_NOT_BE_CURRENT : UPDATE_IS_CURRENT);
+    }
+
+    private boolean positionsMatch(SelectionPositionState expectedUpdate,
+                                   final int newSelStart, final int newSelEnd,
+                                   final int composingSpanStart, final int composingSpanEnd) {
+        if (expectedUpdate instanceof InternalActionEndState) {
+            InternalActionEndState internalActionEndState = (InternalActionEndState) expectedUpdate;
+            // check if the update matches the expected update. note that expected state may
+            // have unknowns, so not matching doesn't necessarily mean this is from an external
+            // action or modification of the action we requested.
+            if (internalActionEndState.selectionStart == newSelStart
+                    && internalActionEndState.selectionEnd == newSelEnd
+                    && internalActionEndState.compositionStart != null
+                    && internalActionEndState.compositionStart == composingSpanStart
+                    && internalActionEndState.compositionEnd != null
+                    && internalActionEndState.compositionEnd == composingSpanEnd) {
+                return true;
+            }
+        } else if (expectedUpdate instanceof SelectionUpdateState) {
+            SelectionUpdateState selectionUpdateState = (SelectionUpdateState) expectedUpdate;
+            if (selectionUpdateState.selectionStart == newSelStart
+                    && selectionUpdateState.selectionEnd == newSelEnd
+                    && selectionUpdateState.compositionStart == composingSpanStart
+                    && selectionUpdateState.compositionEnd == composingSpanEnd) {
+                return true;
+            }
+        }
+        //TODO: (EW) would it be useful to do anything with matches for everything that is unknown?
         return false;
     }
 
-    //TODO: if this is kept, clear this when changing text fields
-    //TODO: if this is kept, probably keep an offset to not hold the whole text
-    private final StringBuilder mExtractedTextCache = new StringBuilder();
+    private boolean positionsMatch(SelectionPositionState expectedUpdate,
+                                   final int newSelStart, final int newSelEnd) {
+        return expectedUpdate != null && expectedUpdate.selectionStart == newSelStart
+                && expectedUpdate.selectionEnd == newSelEnd;
+    }
+
+    private Timer mLostUpdateTimer;
+    private static final long DEFAULT_UPDATE_DELAY = 50;
+    //TODO: (EW) call this when taking actions and after updates
+    private void startLostUpdateTimer() {
+        // stop the timer if it is already running so we can reset when it should trigger
+        stopLostUpdateTimer();
+
+        // find the longest delay for an expected update in the most recent updates so we can
+        // trigger the timer relative to how fast the current device is performing, so we don't add
+        // unnecessary delay or trigger it before it's reasonable to expect the update.
+        long longestDelay = 0;
+        if (mLastUpdateDelays.size() > 0) {
+            for (long delay : mLastUpdateDelays) {
+                if (delay > longestDelay) {
+                    longestDelay = delay;
+                }
+            }
+        } else {
+            longestDelay = DEFAULT_UPDATE_DELAY;
+        }
+
+        mLostUpdateTimer = new Timer();
+        // schedule the timer to be twice the length of the longest recent delay to ensure we're
+        // giving plenty of time to actually get the update if it is coming
+        mLostUpdateTimer.schedule(new TimerTask() {
+            @Override
+            public void run() {
+                checkLostUpdates();
+                if (mUpdatesReceivedHandler != null) {
+                    mUpdatesReceivedHandler.onAllUpdatesReceived();
+                }
+            }
+        }, longestDelay * 2);
+    }
+    private void stopLostUpdateTimer() {
+        if (mLostUpdateTimer == null) {
+            // there isn't anything to do
+            return;
+        }
+        mLostUpdateTimer.cancel();
+        mLostUpdateTimer = null;
+    }
+
+    //TODO: (EW) figure out how this should normally get called
+    public boolean checkLostUpdates() {
+        testLog(TAG, "checkLostUpdates");
+        UpdateExpectation updateExpectation = getUpdateExpectation();
+        testLog(TAG, "checkLostUpdates: lookingForSelectionUpdates="
+                + updateExpectation.lookingForSelectionUpdates);
+        if (!updateExpectation.lookingForSelectionUpdates) {
+            // as far as we're aware, we have received all necessary updates
+            return false;
+        }
+
+        //TODO: (EW) clean up the duplicate code that is after loading the cursor position
+        if (updateExpectation.lastSelectionUpdate instanceof SelectionUpdateState) {
+            SelectionUpdateState selectionUpdateState =
+                    (SelectionUpdateState)updateExpectation.lastSelectionUpdate;
+            if (!selectionUpdateState.updateFullyTaken
+                    && selectionUpdateState.appearsUpToDate != null
+                    && selectionUpdateState.appearsUpToDate
+                    && mState.selectionMatches(selectionUpdateState.selectionStart,
+                            selectionUpdateState.selectionEnd, false)) {
+                // the last update looked up-to-date originally, and there hasn't been an update
+                // since, and the selection position still matches, so since this gets triggered by
+                // the timer, if there were more updates in-flight, when we received this, we should
+                // have already received at least some of them by now, but since that didn't happen,
+                // that update should be up-to-date, so we should take the composition without
+                // needing to verify the current position.
+                boolean statePositionsChanged = false;
+                if (selectionUpdateState.compositionStart == UNKNOWN_POSITION
+                        || selectionUpdateState.compositionEnd == UNKNOWN_POSITION) {
+                    if (selectionUpdateState.compositionStart != mState.getCompositionStart()
+                            || selectionUpdateState.compositionEnd != mState.getCompositionEnd()) {
+                        mState.finishComposingText();
+                        statePositionsChanged = true;
+                    }
+                } else {
+                    if (selectionUpdateState.compositionStart != mState.getCompositionStart()
+                            || selectionUpdateState.compositionEnd != mState.getCompositionEnd()) {
+                        mState.setComposingRegion(selectionUpdateState.compositionStart,
+                                selectionUpdateState.compositionEnd);
+                        statePositionsChanged = true;
+                    }
+                }
+                selectionUpdateState.updateFullyTaken = true;
+                return statePositionsChanged;
+            }
+        }
+
+        boolean statePositionsChanged = false;
+        boolean triedReloadingCache = false;
+
+        // see if we need to take updates from the last selection update
+        if (updateExpectation.nextExpectedSelectionUpdate instanceof InternalActionEndState) {
+            testLog(TAG, "checkLostUpdates: waiting on blocked action");
+            // it looks like action we're waiting for was blocked since we never got an update, so
+            // we should revert back to the last update. since we're not tracking the specific
+            // edits, this means we'll need to clear and reload the text cache. to safeguard against
+            // an editor misbehaving and simply not sending updates when the action did work, we'll
+            // try loading the selection before just blindly taking the last update.
+            mState.invalidateTextCache();
+            LoadAndValidateCacheResult result = loadAndValidateCache(true, true);
+            triedReloadingCache = true;
+            if (updateExpectation.lastSelectionUpdate != null) {
+                boolean takeUpdate = false;
+                if ((result.updateFlags & SELECTION_LOADED) > 0) {
+                    if (mState.selectionMatches(updateExpectation.lastSelectionUpdate.selectionStart,
+                            updateExpectation.lastSelectionUpdate.selectionEnd, false)) {
+                        // we successfully reloaded the current selection, which matches the last
+                        // selection update, so it should be relatively safe to update the
+                        // composition from it
+                        takeUpdate = true;
+                    }
+                } else {
+                    //TODO: (EW) how should we handle no validation of the selection?
+                    takeUpdate = true;
+                }
+                if (takeUpdate) {
+                    statePositionsChanged = updateCompositionFromUpdate(updateExpectation.lastSelectionUpdate);
+                    if (updateExpectation.lastSelectionUpdate instanceof SelectionUpdateState) {
+                        SelectionUpdateState selectionUpdateState = (SelectionUpdateState) updateExpectation.lastSelectionUpdate;
+                        selectionUpdateState.updateFullyTaken = true;
+                    }
+                }
+                //TODO: (EW) do something to flag this and any other internal actions we're waiting
+                // for as having been addressed
+            } else {
+                // since we haven't received an update previously, there isn't anything to fall back
+                // on, so we'll just need to rely on the selection reload and any composition will
+                // have to fall back to an unknown state.
+                mState.invalidateComposition(true);
+            }
+        } else if (updateExpectation.lastSelectionUpdate instanceof SelectionUpdateState) {
+            SelectionUpdateState selectionUpdateState = (SelectionUpdateState) updateExpectation.lastSelectionUpdate;
+            testLog(TAG, "checkLostUpdates: last selection update selection taken: " + selectionUpdateState.selectionTaken);
+            testLog(TAG, "checkLostUpdates: last selection update fully taken: " + selectionUpdateState.updateFullyTaken);
+            testLog(TAG, "checkLostUpdates: last selection update already matched selection: " + selectionUpdateState.expectedSelectionAlreadyMatched);
+            if (!selectionUpdateState.updateFullyTaken) {
+                if (selectionUpdateState.selectionTaken
+                        || selectionUpdateState.expectedSelectionAlreadyMatched) {
+                    if (mState.selectionMatches(selectionUpdateState.selectionStart,
+                            selectionUpdateState.selectionEnd, false)) {
+                        // the last update matches the current state (at least for the cursor position).
+                        // since this gets triggered by the timer, if there were more updates in-flight,
+                        // when we received this, we should have already received at least some of them
+                        // by now, but since that didn't happen, that update should be up-to-date, so we
+                        // should take the composition.
+                        statePositionsChanged = updateCompositionFromUpdate(selectionUpdateState);
+                        selectionUpdateState.updateFullyTaken = true;
+                    } else {
+                        // it seems that we're still waiting on another update
+                        //TODO: maybe trigger another timer. the editor may just have a bug, so
+                        // I don't know that we want a timer repeating forever if that's the
+                        // case. either add some counter for it or call it a lost cause and
+                        // assume we just won't get the update.
+                    }
+                } else {
+                    // we didn't take the update presumably because it seemed out of date or we
+                    // didn't know the absolute positions to know what action update to expect
+                    //TODO: (EW) is there anything worth doing here?
+                    testLog(TAG, "checkLostUpdates: last selection update selection taken: " + selectionUpdateState.selectionTaken);
+                }
+            }
+        }
+
+        //TODO: (EW) handle reloading text for extracted text updates that we weren't able to take
+
+        //TODO: (EW) should this clear part or all of the history so we ensure we don't try looking
+        // for a missing update a second time? we should at least do something to block the same
+        // update as being the next expected one
+        // once this only gets called on the timer, whatever manages starting/stopping it should
+        // address this
+
+        return statePositionsChanged;
+    }
+    public boolean checkLostUpdatesV2() {
+        testLog(TAG, "checkLostUpdates");
+        UpdateExpectationV2 updateExpectation = getUpdateExpectationV2();
+        testLog(TAG, "checkLostUpdates: lookingForSelectionUpdates="
+                + updateExpectation.lookingForSelectionUpdates);
+        if (!updateExpectation.lookingForSelectionUpdates) {
+            // as far as we're aware, we have received all necessary updates
+            return false;
+        }
+
+        //TODO: (EW) clean up the duplicate code that is after loading the cursor position
+        if (updateExpectation.lastSelectionUpdate != null
+                && !updateExpectation.lastSelectionUpdate.isInternalAction()) {
+            SelectionPositionStateV2 selectionUpdateState = updateExpectation.lastSelectionUpdate;
+            if (!selectionUpdateState.selectionUpdateFullyTaken
+                    && selectionUpdateState.updateAppearsUpToDate()
+                    && mState.selectionMatches(selectionUpdateState.selectionStart,
+                            selectionUpdateState.selectionEnd, false)) {
+                // the last update looked up-to-date originally, and there hasn't been an update
+                // since, and the selection position still matches, so since this gets triggered by
+                // the timer, if there were more updates in-flight, when we received this, we should
+                // have already received at least some of them by now, but since that didn't happen,
+                // that update should be up-to-date, so we should take the composition without
+                // needing to verify the current position.
+                boolean statePositionsChanged = false;
+                if (selectionUpdateState.compositionStart == UNKNOWN_POSITION
+                        || selectionUpdateState.compositionEnd == UNKNOWN_POSITION) {
+                    if (selectionUpdateState.compositionStart != mState.getCompositionStart()
+                            || selectionUpdateState.compositionEnd != mState.getCompositionEnd()) {
+                        mState.finishComposingText();
+                        statePositionsChanged = true;
+                    }
+                } else {
+                    if (selectionUpdateState.compositionStart != mState.getCompositionStart()
+                            || selectionUpdateState.compositionEnd != mState.getCompositionEnd()) {
+                        mState.setComposingRegion(selectionUpdateState.compositionStart,
+                                selectionUpdateState.compositionEnd);
+                        statePositionsChanged = true;
+                    }
+                }
+                selectionUpdateState.selectionUpdateFullyTaken = true;
+                return statePositionsChanged;
+            }
+        }
+
+        boolean statePositionsChanged = false;
+        boolean triedReloadingCache = false;
+
+        // see if we need to take updates from the last selection update
+        if (updateExpectation.nextExpectedSelectionUpdate != null
+                && updateExpectation.nextExpectedSelectionUpdate.isInternalAction()) {
+            testLog(TAG, "checkLostUpdates: waiting on blocked action");
+            // it looks like action we're waiting for was blocked since we never got an update, so
+            // we should revert back to the last update. since we're not tracking the specific
+            // edits, this means we'll need to clear and reload the text cache. to safeguard against
+            // an editor misbehaving and simply not sending updates when the action did work, we'll
+            // try loading the selection before just blindly taking the last update.
+            mState.invalidateTextCache();
+            LoadAndValidateCacheResult result = loadAndValidateCache(true, true);
+            triedReloadingCache = true;
+            if (updateExpectation.lastSelectionUpdate != null) {
+                boolean takeUpdate = false;
+                if ((result.updateFlags & SELECTION_LOADED) > 0) {
+                    if (mState.selectionMatches(updateExpectation.lastSelectionUpdate.selectionStart,
+                            updateExpectation.lastSelectionUpdate.selectionEnd, false)) {
+                        // we successfully reloaded the current selection, which matches the last
+                        // selection update, so it should be relatively safe to update the
+                        // composition from it
+                        takeUpdate = true;
+                    }
+                } else {
+                    //TODO: (EW) how should we handle no validation of the selection?
+                    takeUpdate = true;
+                }
+                if (takeUpdate) {
+                    statePositionsChanged = updateCompositionFromUpdate(updateExpectation.lastSelectionUpdate);
+                    if (updateExpectation.lastSelectionUpdate.isSelectionUpdate()) {
+                        updateExpectation.lastSelectionUpdate.selectionUpdateFullyTaken = true;
+                    }
+                }
+                //TODO: (EW) do something to flag this and any other internal actions we're waiting
+                // for as having been addressed
+            } else {
+                // since we haven't received an update previously, there isn't anything to fall back
+                // on, so we'll just need to rely on the selection reload and any composition will
+                // have to fall back to an unknown state.
+                mState.invalidateComposition(true);
+            }
+        } else if (updateExpectation.lastSelectionUpdate != null
+                && updateExpectation.lastSelectionUpdate.isSelectionUpdate()) {
+            SelectionPositionStateV2 selectionUpdateState = updateExpectation.lastSelectionUpdate;
+            testLog(TAG, "checkLostUpdates: last selection update selection taken: " + selectionUpdateState.selectionTaken);
+            testLog(TAG, "checkLostUpdates: last selection update fully taken: " + selectionUpdateState.selectionUpdateFullyTaken);
+            testLog(TAG, "checkLostUpdates: last selection update already matched selection: " + selectionUpdateState.expectedSelectionAlreadyMatched);
+            if (!selectionUpdateState.selectionUpdateFullyTaken) {
+                if (selectionUpdateState.selectionTaken
+                        || selectionUpdateState.expectedSelectionAlreadyMatched) {
+                    if (mState.selectionMatches(selectionUpdateState.selectionStart,
+                            selectionUpdateState.selectionEnd, false)) {
+                        // the last update matches the current state (at least for the cursor position).
+                        // since this gets triggered by the timer, if there were more updates in-flight,
+                        // when we received this, we should have already received at least some of them
+                        // by now, but since that didn't happen, that update should be up-to-date, so we
+                        // should take the composition.
+                        statePositionsChanged = updateCompositionFromUpdate(selectionUpdateState);
+                        selectionUpdateState.selectionUpdateFullyTaken = true;
+                    } else {
+                        // it seems that we're still waiting on another update
+                        //TODO: maybe trigger another timer. the editor may just have a bug, so
+                        // I don't know that we want a timer repeating forever if that's the
+                        // case. either add some counter for it or call it a lost cause and
+                        // assume we just won't get the update.
+                    }
+                } else {
+                    // we didn't take the update presumably because it seemed out of date or we
+                    // didn't know the absolute positions to know what action update to expect
+                    //TODO: (EW) is there anything worth doing here?
+                    testLog(TAG, "checkLostUpdates: last selection update selection taken: " + selectionUpdateState.selectionTaken);
+                }
+            }
+        }
+
+        //TODO: (EW) handle reloading text for extracted text updates that we weren't able to take
+
+        //TODO: (EW) should this clear part or all of the history so we ensure we don't try looking
+        // for a missing update a second time? we should at least do something to block the same
+        // update as being the next expected one
+        // once this only gets called on the timer, whatever manages starting/stopping it should
+        // address this
+
+        return statePositionsChanged;
+    }
+
+    private boolean updateCompositionFromUpdate(SelectionPositionState state) {
+        boolean statePositionsChanged = false;
+        int compositionStart;
+        int compositionEnd;
+        if (state instanceof SelectionUpdateState) {
+            SelectionUpdateState selectionUpdateState = (SelectionUpdateState) state;
+            compositionStart = selectionUpdateState.compositionStart;
+            compositionEnd = selectionUpdateState.compositionEnd;
+        } else if (state instanceof InternalActionEndState) {
+            InternalActionEndState internalActionEndState = (InternalActionEndState) state;
+            if (internalActionEndState.compositionStart == null || internalActionEndState.compositionEnd == null) {
+                return false;
+            }
+            compositionStart = internalActionEndState.compositionStart;
+            compositionEnd = internalActionEndState.compositionEnd;
+        } else {
+            return false;
+        }
+        if (compositionStart == UNKNOWN_POSITION || compositionEnd == UNKNOWN_POSITION) {
+            if (mState.isCompositionUnknown() || mState.hasComposition()) {
+                mState.finishComposingText();
+                statePositionsChanged = true;
+            }
+        } else {
+            if (compositionStart != mState.getCompositionStart()
+                    || compositionEnd != mState.getCompositionEnd()) {
+                mState.setComposingRegion(compositionStart, compositionEnd);
+                statePositionsChanged = true;
+            }
+        }
+        return statePositionsChanged;
+    }
+    private boolean updateCompositionFromUpdate(SelectionPositionStateV2 state) {
+        if (state.compositionStart == null || state.compositionEnd == null) {
+            return false;
+        }
+        boolean statePositionsChanged = false;
+        if (state.compositionStart == UNKNOWN_POSITION
+                || state.compositionEnd == UNKNOWN_POSITION) {
+            if (mState.isCompositionUnknown() || mState.hasComposition()) {
+                mState.finishComposingText();
+                statePositionsChanged = true;
+            }
+        } else {
+            if (state.compositionStart != mState.getCompositionStart()
+                    || state.compositionEnd != mState.getCompositionEnd()) {
+                mState.setComposingRegion(state.compositionStart, state.compositionEnd);
+                statePositionsChanged = true;
+            }
+        }
+        return statePositionsChanged;
+    }
+
     //TODO: maybe this should return if the composing text changed. alternatively have a function to
     // get the composing text so it can be compared before and after this call.
     public boolean onUpdateExtractedText(final int token, final ExtractedText text) {
@@ -2221,288 +3287,383 @@ public final class RichInputConnection {
             updatedSelectionStart = text.startOffset + text.selectionEnd;
             updatedSelectionEnd = text.startOffset + text.selectionStart;
         }
+
         boolean selectionMatches = mState.selectionMatches(updatedSelectionStart, updatedSelectionEnd, false);
-        if (!selectionMatches) {
-            // verify this update is up-to-date
+
+        UpdateExpectation updateExpectation = getUpdateExpectation();
+        boolean wasExpected;
+        boolean takeSelectionUpdate;
+        boolean takeTextUpdate;
+        Boolean appearsUpToDate;
+        boolean statePositionsChanged = false;
+        ReloadedSelectionPositionState selectionReloadState = null;
+        if (!updateExpectation.lookingForExtractedTextUpdates) {
+            //TODO: (EW) I think this should check that we're not waiting for selection updates. if
+            // we are, that means something unexpected happened, so it could mess things up to take
+            // it.
+            testLog(TAG, "onUpdateExtractedText: unexpected but not waiting for updates: " + mState.getDebugState());
+            // we could try to verify if this update is up-to-date, but it isn't going to conflict
+            // with other updates that we're waiting for, so to avoid making additional IPC calls,
+            // we'll just assume it's up-to-date and take the update. even if this is out-of-date,
+            // it isn't really any different from not even getting the update yet. we don't normally
+            // verify the state before doing actions, so those cases would have the same sort of
+            // effect of working off of old data.
+            wasExpected = false;
+            appearsUpToDate = null;
+            // if the cursor position was already updated, this must mean onUpdateSelection was
+            // already called and updated that or this change doesn't actually modify the cursor
+            // position, so any text changes should already be accounted for. if this does have a
+            // cursor change, depending on the update type, we might be able to just shift the text
+            // and cursor positions safely, so we don't need to do any preemptive clearing of the
+            // cache.
+            takeSelectionUpdate = true;
+            takeTextUpdate = true;
+        } else if (positionsMatch(updateExpectation.nextExpectedExtractedTextUpdate,
+                updatedSelectionStart, updatedSelectionEnd)) {
+            wasExpected = true;
+            takeSelectionUpdate = false;
+            // only update from up-to-date updates. multiple actions could modify the same position,
+            // so if we already modified this text again pulling in updates from an old action could
+            // mess up the cache. we'll need to wait for all the updates to come in to manually
+            // reload the text in case it changed and we weren't able to take it.
+            //TODO: (EW) how should we flag the update to be taken later
+            takeTextUpdate = updateExpectation.actionsWaitingForExtractedTextUpdates == 1
+                    /*&& !mState.selectionMatches(updatedSelectionStart, updatedSelectionEnd, false)
+                    && (!(updateExpectation.lastUpdate instanceof UpdatePositionState)
+                            || ((UpdatePositionState)updateExpectation.lastUpdate).selectionTaken)*/;
+            //TODO: (EW) maybe determine - currently doesn't matter
+            appearsUpToDate = null;
+
+            if (updateExpectation.nextExpectedExtractedTextUpdate instanceof InternalActionEndState) {
+                InternalActionEndState expectedUpdate =
+                        (InternalActionEndState) updateExpectation.nextExpectedExtractedTextUpdate;
+
+                expectedUpdate.extractedTextUpdateTime = SystemClock.uptimeMillis();
+                mLastUpdateDelays.add(
+                        expectedUpdate.extractedTextUpdateTime - expectedUpdate.actionTime);
+                while (mLastUpdateDelays.size() > UPDATE_DELAYS_TRACK_COUNT) {
+                    mLastUpdateDelays.remove(0);
+                }
+                testLog(TAG, "onUpdateExtractedText: update matched next expected update and took "
+                        + (expectedUpdate.extractedTextUpdateTime - expectedUpdate.actionTime)
+                        + " ms");
+            }
+        } else {
+            testLog(TAG, "onUpdateExtractedText: update didn't match what was expected: " + updateExpectation.nextExpectedExtractedTextUpdate);
+            wasExpected = false;
+            //TODO: (EW) we could try pairing this with the last unexpected selection update to
+            // consider this expected (do the inverse in onUpdateSelection too) - probably actually
+            // should do this in getUpdateExpectation
+
+            // since we had an action that we're waiting for an update from that doesn't match this
+            // update, we can't take an update to shift the text since it's not clear what needs to
+            // shift to compensate for the action we expected.
+            takeSelectionUpdate = false;
+            // verify this update is up-to-date. this will update the cache with current cursor
+            // positions (if they could be loaded), and it may clear text from the cache depending
+            // on how the selection positions change.
             int updateFlags = loadAndValidateCache(0, 0, true).updateFlags;
             if ((updateFlags & SELECTION_LOADED) > 0) {
-                if (!mState.selectionMatches(updatedSelectionStart, updatedSelectionEnd, false)) {
-                    // this update appears to be out-of-date. sometimes if multiple things happen in
-                    // quick succession, the updates get to us late (ie: get an update for the first
-                    // action after having completed the second action), so we should just ignore
-                    // this
-                    //TODO: (EW) tests currently don't seem to cover this
-                    Log.e(TAG, "onUpdateExtractedText: out-of-date update: current selection start = "
-                            + mState.getSelectionStart() + ", current selection end = " + mState.getSelectionEnd());
-                    if ((updateFlags & SELECTION_CORRECTED) > 0) {
-                        // the cached state, update state, and verified state are all different.
-                        // loadAndValidateCache should have already handled clearing the caches if
-                        // necessary
-                        return false;
+                appearsUpToDate = mState.selectionMatches(updatedSelectionStart, updatedSelectionEnd, false);
+                if (appearsUpToDate) {
+                    //TODO: (EW) this still could be out-of-date. is this safe? is there something
+                    // else we can do? would it be better to just never take these uncertain cases?
+                    // if the selection changed, it should have wiped the text cache. sitting in a
+                    // blank state isn't too bad. we can probably just get the text later when we
+                    // need it.
+                    if ((updateFlags & SELECTION_UPDATED) > 0) {
+                        takeTextUpdate = false;
+                        statePositionsChanged = true;
+                        selectionReloadState = new ReloadedSelectionPositionState(
+                                mState.getSelectionStart(), mState.getSelectionEnd());
                     } else {
-                        // even though the current update doesn't match the expected state, the
-                        // verified current state does match the expected state, so we'll basically
-                        // ignore this update and indicate that we're up-to-date already. note that
-                        // the composition could be wrong, but there isn't any way to check that.
-                        return true;
+                        takeTextUpdate = true;
                     }
+                } else {
+                    //TODO: (EW) how should we flag the update to be taken later
+                    takeTextUpdate = false;
                 }
             } else {
-                // we couldn't verify whether this update is current. the most common case for an
-                // unexpected cursor change is simply from the user clicking somewhere in the field
-                // to move the cursor, but in that case, there wouldn't be a text change, so this
-                // shouldn't be called.
-                //TODO: (EW) maybe just ignore this. maybe also clear some/all of the cache to avoid
-                // an incorrect cache
+                // since we couldn't do anything to verify if this update is up-to-date, we should
+                // skip taking the update as this could mess up the cache, and it would be better to
+                // have wrong text that matches what the user entered into the IME than some wildly
+                // unexpected text. we also can leave the selection update to onUpdateSelection to
+                // since it gets more info.
+//                takeTextUpdate = false;
+                //TODO: (EW) I don't think this is the right thing to do, but doing for now to make
+                // existing tests pass. once we have a structure to reload this later and update the
+                // existing tests, this should be changed.
+                takeTextUpdate = true;
+                takeSelectionUpdate = true;
 
-                // we couldn't verify whether this update is current, but an unexpected cursor
-                // change is much more likely than an out-of-date update, so we'll assume that's the
-                // case for the most part, but we should do some safeguarding in case that's not the
-                // case. if it is just an out-of-date update, changing the tracked selection
-                // positions could cause some unexpected behavior, but there doesn't seem to be much
-                // alternative. clearing the cache is relatively safe. at worst, we'll have to
-                // reload it and maybe won't be able to get some of it and extra IPC calls may lag
-                // things worse since the system is already running slow.
-                //TODO: (EW) we should track times for IPC calls to get a gauge of whether calls are
-                // lagging to potentially use here to avoid messing up the state. even if we know it
-                // has been lagging, we can't just ignore all updates because a very likely use case
-                // is for the user to click a different part of the text, which would give us an
-                // unexpected change.
-                // we could also try to track the previous position from the beginning of the last
-                // batch to compare to the old selection positions, but if we were already lagging,
-                // we may not have the (right) update by then. also, we could get an update from
-                // outside of our app's requests that won't fit, so this may not really work
-                // either.
-                // we could try to reload the cached text before the cursor to validate at least
-                // most of the text is accurate, but that could indicate that text was added/removed
-                // before the cached text or the update is out-of-date, so that probably doesn't
-                // really help.
-                if (updatedSelectionStart != mState.getSelectionStart()) {
-                    testLog(TAG, "onUpdateExtractedText: invalidateTextCache - couldn't verify whether the cursor start change is current");
+                appearsUpToDate = null;
+            }
+        }
+
+        testLog(TAG, "onUpdateExtractedText: wasExpected=" + wasExpected + ", takeTextUpdate=" + takeTextUpdate
+                + ", takeSelectionUpdate=" + takeSelectionUpdate);
+
+        if (!wasExpected) {
+            //TODO: (EW) I think we already updated the state at least in some cases, so this seems
+            // incorrect (or maybe it should be renamed if it's just looking for if the end state
+            // when receiving the update matches the update)
+            boolean selectionTaken = mState.selectionMatches(updatedSelectionStart, updatedSelectionEnd, false);
+            ExtractedTextUpdateState workingExtractedTextUpdateState = new ExtractedTextUpdateState(
+                    updatedSelectionStart, updatedSelectionEnd, appearsUpToDate, selectionTaken);
+            testLog(TAG, "onUpdateExtractedText: add mStateHistory entry: " + workingExtractedTextUpdateState);
+            mStateHistory.add(workingExtractedTextUpdateState);
+            // if we updated the selection from a call to check the position and that indicated that the
+            // update was out-of-date, keep track of where we updated the selection from. if we have an
+            // up-to-date update, we can see that we update from that
+            if (appearsUpToDate != null && !appearsUpToDate && selectionReloadState != null) {
+                // only need to add the entry in the history
+                mStateHistory.add(selectionReloadState);
+            }
+        }
+
+        if (takeTextUpdate) {
+            final int offset;
+            if (text.partialStartOffset < 0 && text.partialEndOffset < 0) {
+                // full text is available (maybe limited and need to check startOffset)
+                testLog(TAG, "onUpdateExtractedText: update type = " + (text.startOffset == 0 ? "full text" : "large text block"));
+                offset = text.startOffset;
+            } else if (text.partialStartOffset < 0 || text.partialEndOffset < 0) {
+                //TODO: (EW) saw this in the number field in loremipsum.io in duckduckgo browser. in
+                // this case it sent the whole text, so maybe -1 was meant to indicate no partial start
+                // (ie equivalent to 0)
+                testLogImportant(TAG, "onUpdateExtractedText: partialStartOffset=" + text.partialStartOffset
+                        + ", partialEndOffset=" + text.partialEndOffset + ": not sure how to handle");
+                return true;
+            } else {
+                // only need to update a small bit since only partial text is passed
+                testLog(TAG, "onUpdateExtractedText: update type = partial text");
+                offset = text.partialStartOffset;
+            }
+
+            boolean textTaken = false;
+
+            //TODO: (EW) we probably don't need this variable
+            final boolean unexpectedCursorChange;
+            if (takeSelectionUpdate) {
+                if (mState.areSelectionAbsolutePositionsKnown()) {
+                    if (!mState.selectionMatches(updatedSelectionStart,
+                            updatedSelectionEnd, false)) {
+                        // since the selection change isn't already handled, this means this was called
+                        // before onUpdateSelection
+
+                        unexpectedCursorChange = true;
+
+                        final int oldExpectedSelStart = mState.getSelectionStart();
+                        final int oldExpectedSelEnd = mState.getSelectionEnd();
+                        if (text.partialStartOffset >= 0) {
+                            // updates in this format show how much text was inserted/removed
+                            final int textLengthChange = text.text.length() - (text.partialEndOffset - text.partialStartOffset);
+                            final int selectionStartChange = updatedSelectionStart - oldExpectedSelStart;
+                            final int selectionEndChange = updatedSelectionEnd - oldExpectedSelEnd;
+                            if ((text.partialEndOffset <= oldExpectedSelStart
+                                    && selectionStartChange == selectionEndChange
+                                    && textLengthChange == selectionStartChange)) {
+                                // this cursor change appears to just be from text being inserted/removed
+                                // before the cursor from an external source, which means that the cached
+                                // text around the cursor outside of the changed text should still be
+                                // accurate
+                                // insert/remove space in the cache where the change is to make sure the
+                                // text before the change is still cached correctly
+                                testLog(TAG, "onUpdateExtractedText: replaceTextAbsolute 1 before " + mState.getDebugStateInternal());
+                                mState.replaceTextAbsolute(text.partialStartOffset,
+                                        text.partialEndOffset, text.text);
+                                textTaken = true;
+                                testLog(TAG, "onUpdateExtractedText: replaceTextAbsolute 1 after " + mState.getDebugStateInternal());
+                                if (!mState.selectionMatches(updatedSelectionStart, updatedSelectionEnd, false)) {
+                                    if (!mState.selectionMatches(updatedSelectionStart, updatedSelectionEnd, true)) {
+                                        throw new RuntimeException("selection: "
+                                                + mState.getSelectionStart() + " - " + mState.getSelectionEnd()
+                                                + " != " + updatedSelectionStart + " - " + updatedSelectionEnd);
+                                    }
+                                    testLog(TAG, "onUpdateExtractedText: updatedSelectionStart="
+                                            + updatedSelectionStart + ", updatedSelectionEnd=" + updatedSelectionEnd);
+                                    //TODO: (EW) possibly should also invalidate the cache to be safe
+                                    mState.setSelection(updatedSelectionStart, updatedSelectionEnd);
+                                    textTaken = false;
+                                    testLog(TAG, "onUpdateExtractedText: setSelection " + mState.getDebugStateInternal());
+                                }
+                            } else if (text.partialStartOffset >= oldExpectedSelStart
+                                    && selectionStartChange == 0
+                                    && text.partialEndOffset <= oldExpectedSelEnd
+                                    && textLengthChange == selectionEndChange) {
+                                // this cursor change appears to just be from text being inserted/removed in
+                                // the selected text from an external source, which means that the cached
+                                // text around the cursor outside of the changed text should still be
+                                // accurate
+                                // insert/remove space in the cache where the change is to make sure the
+                                // text after the change is still cached correctly
+                                testLog(TAG, "onUpdateExtractedText: replaceTextAbsolute 2 before " + mState.getDebugStateInternal());
+                                mState.replaceTextAbsolute(text.partialStartOffset,
+                                        text.partialEndOffset, text.text);
+                                textTaken = true;
+                                testLog(TAG, "onUpdateExtractedText: replaceTextAbsolute 2 after " + mState.getDebugStateInternal());
+                                if (!mState.selectionMatches(updatedSelectionStart, updatedSelectionEnd, false)) {
+                                    if (!mState.selectionMatches(updatedSelectionStart, updatedSelectionEnd, true)) {
+                                        throw new RuntimeException("selection: "
+                                                + mState.getSelectionStart() + " - " + mState.getSelectionEnd()
+                                                + " != " + updatedSelectionStart + " - " + updatedSelectionEnd);
+                                    }
+                                    //TODO: (EW) possibly should also invalidate the cache to be safe
+                                    mState.setSelection(updatedSelectionStart, updatedSelectionEnd);
+                                    textTaken = false;
+                                    testLog(TAG, "onUpdateExtractedText: setSelection " + mState.getDebugStateInternal());
+                                }
+                            } else {
+                                // it's not clear that the change is simply due to the length of the text
+                                // before the cursor changing, and it's less likely that this is just a
+                                // cursor movement since this is called for a text change, so there probably
+                                // isn't anything in the cache that we can trust is still accurate
+                                //TODO: is this^ accurate? - revalidate if there is anything else safe to keep
+                                testLog(TAG, "onUpdateExtractedText: invalidateTextCache - unclear cursor change in partial update");
+                                mState.invalidateTextCache();
+                                mState.setSelection(updatedSelectionStart, updatedSelectionEnd);
+                                //TODO: (EW) probably also need to mark the composition as unknown
+                            }
+                        } else {
+                            // updates in this format don't show how much text was inserted/removed, so we
+                            // don't know what text in the cache would be valid if we just shifted it
+                            if (mState.getSelectionStart() != updatedSelectionStart) {
+                                // the cursor could have moved (just need to shift the relative position of
+                                // the cache) or the text before the cursor changed length (a large portion
+                                // of the cache is still correct, but the length of the text before the
+                                // cursor and the offset need to be updated) or both (difficult to tell what
+                                // in the cache can be trusted to still be accurate), so we can't be sure
+                                // what is still valid. it's probably safe to assume that the text before
+                                // what is passed here is unchanged, so that much can be kept
+                                //TODO: validate if this^ is correct - if we requested a limited extract,
+                                // what text would be returned (full change regardless, hard limit around
+                                // the cursor, full change unless the change is larger than the limit,
+                                // other options?)? if anything at this point can't be trusted, this should
+                                // be a limit on our cache
+                                testLog(TAG, "onUpdateExtractedText: invalidateTextCacheAfter "
+                                        + (text.startOffset - 1) + " - changing cursor start in full update");
+                                mState.invalidateTextCacheAfterAbsolute(text.startOffset - 1);
+                                mState.setSelection(updatedSelectionStart, updatedSelectionEnd);
+                            } else /* mState.getSelectionEnd() != updatedSelectionEnd */ {
+                                // the cursor end could have moved (the cache is unaffected) or the text in
+                                // the selection changed length (some of the text in the cache needs to
+                                // shift) or both (nothing in cache can be trusted to be accurate).
+                                //TODO: it might be safe to assume that anything after the returned text and
+                                // before the cursor end is still valid (probably still need to shift what's
+                                // in the cache based on how much the cursor position changed)
+                                testLog(TAG, "onUpdateExtractedText: invalidateTextCacheAfter "
+                                        + (text.text.length() + text.startOffset - 1)
+                                        + " - changing cursor end in full update");
+                                mState.invalidateTextCacheAfterAbsolute(
+                                        text.text.length() + text.startOffset - 1);
+                                mState.setSelectionLength(
+                                        updatedSelectionEnd - updatedSelectionStart);
+                            }
+                        }
+                        //TODO: since we're changing the cursor position, this is probably going to break the
+                        // unexpected change in onUpdateSelection if that's called after, so this will also need
+                        // the same return value
+                    } else {
+                        unexpectedCursorChange = false;
+                        //TODO: (EW) should we reset the composition to unknown if the change
+                        // potentially could have changed it, or is it fine to just rely on the
+                        // selection update to manage it soon enough?
+                    }
+                } else {
+                    // we don't know where the cursor was, so we can't be certain that the cursor is in the
+                    // same position relative to the cache now, so there probably isn't anything in the
+                    // cache that we can trust is still accurate
+                    testLog(TAG, "onUpdateExtractedText: invalidateTextCache - unknown cursor position");
                     mState.invalidateTextCache();
-                } else {
-                    // the selection end is different. most things work off of the selection start,
-                    // so even if this is an out-of-date update, changing the selection end
-                    // shouldn't cause as much of an issue. also, the text before the cursor should
-                    // be safe to keep in either case.
-                    mState.invalidateTextCacheAfterRelative(-1);
-                    //TODO: (EW) should we invalidate anything related to where the update is in
-                    // case this is a current update with a change? maybe compare to existing text
-                    // and wipe any differences
+                    //TODO: is this the right way to handle this - this is probably the safest option
+                    unexpectedCursorChange = true;
+
+                    mState.setSelection(updatedSelectionStart, updatedSelectionEnd);
                 }
-                // since we're not sure if this is out-of-date, we shouldn't add the text to the
-                // cache to be safe
-                //TODO: (EW) this breaks 105 tests (it looks like all are just due to not having the
-                // composition cached)
-//                return false;
-            }
-        }
-        if (text.partialStartOffset < 0 && text.partialEndOffset < 0) {
-            // full text is available (maybe limited and need to check startOffset)
-            if (mExtractedTextCache.length() < text.selectionStart + text.startOffset) {
-                setLength(mExtractedTextCache, /*text.selectionStart + */text.startOffset);
-            }
-            // we don't have a way to determine what might exist past the returned text (could be
-            // shifted to make room for the additional text, left unchanged, or removed entirely),
-            // so we'll just remove it to be safe
-            //TODO: I think we might be able to keep some if the max known position is after this,
-            // assuming we can check for a shift, but this might not be safe - verify
-            mExtractedTextCache.replace(/*text.selectionStart + */text.startOffset, mExtractedTextCache.length(), text.text.toString());
-        } else if (text.partialStartOffset < 0 || text.partialEndOffset < 0) {
-            //TODO: (EW) saw this in the number field in loremipsum.io in duckduckgo browser. in
-            // this case it sent the whole text, so maybe -1 was meant to indicate no partial start
-            // (ie equivalent to 0)
-            testLogImportant(TAG, "onUpdateExtractedText: partialStartOffset=" + text.partialStartOffset
-                    + ", partialEndOffset=" + text.partialEndOffset + ": not sure how to handle");
-            return true;
-        } else {
-            // only need to update a small bit since only partial text is passed
-            if (mExtractedTextCache.length() < text.partialStartOffset) {
-                setLength(mExtractedTextCache, text.partialStartOffset);
-            }
-            mExtractedTextCache.replace(text.partialStartOffset, Math.min(text.partialEndOffset, mExtractedTextCache.length()), text.text.toString());
-        }
 
-        //TODO: handle unknown cursor position
-        //TODO: validate cursor position - figure out what to do when they don't match
-        //TODO: find documentation and verify intended functionality of the ExtractedText
-        //TODO: figure out how startOffset should be used
-        //TODO: update the composing text
-        final int offset;
-        if (text.partialStartOffset < 0) {
-            // full text is available (maybe limited and need to check startOffset)
-            testLog(TAG, "onUpdateExtractedText: update type = " + (text.startOffset == 0 ? "full text" : "large text block"));
-            offset = text.startOffset;
-        } else {
-            // only need to update a small bit since only partial text is passed
-            testLog(TAG, "onUpdateExtractedText: update type = partial text");
-            offset = text.partialStartOffset;
-        }
 
-        //TODO: (EW) with already having updated the cursor position (which also may have cleared
-        // some things from the cache), we should be able to simplify this to just update the cache
-        // with the new text.
-        final boolean unexpectedCursorChange;
-        if (mState.areSelectionAbsolutePositionsKnown()) {
-            if (!mState.selectionMatches(updatedSelectionStart,
-                    updatedSelectionEnd, false)) {
-                // since the selection change isn't already handled, this means this was called
-                // before onUpdateSelection
+            } else {
+                //TODO: (EW) this is a guess
+                unexpectedCursorChange = !selectionMatches;
+            }
 
-                unexpectedCursorChange = true;
-                final int oldExpectedSelStart = mState.getSelectionStart();
-                final int oldExpectedSelEnd = mState.getSelectionEnd();
-                if (text.partialStartOffset >= 0) {
-                    // updates in this format show how much text was inserted/removed
+            final int updatedTextEnd = text.text.length() + offset;
+            if (updatedTextEnd >= mState.getSelectionEnd()) {
+                if (text.partialStartOffset < 0) {
+                    // full text (maybe limited) is sent, so we can't be certain that there is more text
+                    // after what was sent. we can't rely on the expected composition because that isn't
+                    // updated here and if onUpdateSelection is called after this for this change, it
+                    // won't know to remove the text at the end of the cache, so that has to be done
+                    // here
+                    testLog(TAG, "onUpdateExtractedText: invalidateTextCacheAfter "
+                            + (updatedTextEnd - 1) + " - clear after full update");
+                    mState.invalidateTextCacheAfterAbsolute(updatedTextEnd - 1);
+                } else {
                     final int textLengthChange = text.text.length() - (text.partialEndOffset - text.partialStartOffset);
-                    final int selectionStartChange = updatedSelectionStart - oldExpectedSelStart;
-                    final int selectionEndChange = updatedSelectionEnd - oldExpectedSelEnd;
-                    if ((text.partialEndOffset <= oldExpectedSelStart
-                            && selectionStartChange == selectionEndChange
-                            && textLengthChange == selectionStartChange)) {
-                        // this cursor change appears to just be from text being inserted/removed
-                        // before the cursor from an external source, which means that the cached
-                        // text around the cursor outside of the changed text should still be
-                        // accurate
-                        // insert/remove space in the cache where the change is to make sure the
-                        // text before the change is still cached correctly
-                        mState.replaceTextAbsolute(text.partialStartOffset,
-                                text.partialEndOffset, text.text);
-                        //TODO: avoid the double update below - that shouldn't cause problems but is redundant
-                    } else if (text.partialStartOffset >= oldExpectedSelStart
-                            && selectionStartChange == 0
-                            && text.partialEndOffset <= oldExpectedSelEnd
-                            && textLengthChange == selectionEndChange) {
-                        // this cursor change appears to just be from text being inserted/removed in
-                        // the selected text from an external source, which means that the cached
-                        // text around the cursor outside of the changed text should still be
-                        // accurate
-                        // insert/remove space in the cache where the change is to make sure the
-                        // text after the change is still cached correctly
-                        mState.replaceTextAbsolute(text.partialStartOffset,
-                                text.partialEndOffset, text.text);
-                        //TODO: avoid the double update below - that shouldn't cause problems but is redundant
-                    } else {
-                        // it's not clear that the change is simply due to the length of the text
-                        // before the cursor changing, and it's less likely that this is just a
-                        // cursor movement since this is called for a text change, so there probably
-                        // isn't anything in the cache that we can trust is still accurate
-                        //TODO: is this^ accurate? - revalidate if there is anything else safe to keep
-                        testLog(TAG, "onUpdateExtractedText: invalidateTextCache - unclear cursor change in partial update");
-                        mState.invalidateTextCache();
-                        mState.setSelection(updatedSelectionStart, updatedSelectionEnd);
-                        //TODO: (EW) probably also need to mark the composition as unknown
-                    }
-                } else {
-                    // updates in this format don't show how much text was inserted/removed, so we
-                    // don't know what text in the cache would be valid if we just shifted it
-                    if (mState.getSelectionStart() != updatedSelectionStart) {
-                        // the cursor could have moved (just need to shift the relative position of
-                        // the cache) or the text before the cursor changed length (a large portion
-                        // of the cache is still correct, but the length of the text before the
-                        // cursor and the offset need to be updated) or both (difficult to tell what
-                        // in the cache can be trusted to still be accurate), so we can't be sure
-                        // what is still valid. it's probably safe to assume that the text before
-                        // what is passed here is unchanged, so that much can be kept
-                        //TODO: validate if this^ is correct - if we requested a limited extract,
-                        // what text would be returned (full change regardless, hard limit around
-                        // the cursor, full change unless the change is larger than the limit,
-                        // other options?)? if anything at this point can't be trusted, this should
-                        // be a limit on our cache
-                        testLog(TAG, "onUpdateExtractedText: invalidateTextCacheAfter "
-                                + (text.startOffset - 1) + " - changing cursor start in full update");
-                        mState.invalidateTextCacheAfterAbsolute(text.startOffset - 1);
-                        mState.setSelection(updatedSelectionStart, updatedSelectionEnd);
-                    } else /* mState.getSelectionEnd() != updatedSelectionEnd */ {
-                        // the cursor end could have moved (the cache is unaffected) or the text in
-                        // the selection changed length (some of the text in the cache needs to
-                        // shift) or both (nothing in cache can be trusted to be accurate).
-                        //TODO: it might be safe to assume that anything after the returned text and
-                        // before the cursor end is still valid (probably still need to shift what's
-                        // in the cache based on how much the cursor position changed)
-                        testLog(TAG, "onUpdateExtractedText: invalidateTextCacheAfter "
-                                + (text.text.length() + text.startOffset - 1)
-                                + " - changing cursor end in full update");
-                        mState.invalidateTextCacheAfterAbsolute(
-                                text.text.length() + text.startOffset - 1);
-                        mState.setSelectionLength(
-                                updatedSelectionEnd - updatedSelectionStart);
-                    }
-                }
-                //TODO: since we're changing the cursor position, this is probably going to break the
-                // unexpected change in onUpdateSelection if that's called after, so this will also need
-                // the same return value
-            } else {
-                unexpectedCursorChange = false;
-            }
-        } else {
-            // we don't know where the cursor was, so we can't be certain that the cursor is in the
-            // same position relative to the cache now, so there probably isn't anything in the
-            // cache that we can trust is still accurate
-            testLog(TAG, "onUpdateExtractedText: invalidateTextCache - unknown cursor position");
-            mState.invalidateTextCache();
-            //TODO: is this the right way to handle this - this is probably the safest option
-            unexpectedCursorChange = true;
-
-            mState.setSelection(updatedSelectionStart, updatedSelectionEnd);
-        }
-
-        final int updatedTextEnd = text.text.length() + offset;
-        if (updatedTextEnd >= mState.getSelectionEnd()) {
-            if (text.partialStartOffset < 0) {
-                // full text (maybe limited) is sent, so we can't be certain that there is more text
-                // after what was sent. we can't rely on the expected composition because that isn't
-                // updated here and if onUpdateSelection is called after this for this change, it
-                // won't know to remove the text at the end of the cache, so that has to be done
-                // here
-                testLog(TAG, "onUpdateExtractedText: invalidateTextCacheAfter "
-                        + (updatedTextEnd - 1) + " - clear after full update");
-                mState.invalidateTextCacheAfterAbsolute(updatedTextEnd - 1);
-            } else {
-                final int textLengthChange = text.text.length() - (text.partialEndOffset - text.partialStartOffset);
-                if (textLengthChange < 0) {
-                    if (composingSpanEnd > updatedTextEnd) {
-                        // since we know how much text is getting removed, we can at least be sure that
-                        // the new full text's length isn't less than this change removed from the
-                        // furthest known position
-                        testLog(TAG, "onUpdateExtractedText: invalidateTextCacheAfter "
-                                + /*Math.max(updatedTextEnd, composingSpanEnd - textLengthChange)*/(updatedTextEnd - 1)
-                                + " - clear based on composing end in partial update");
-//                    invalidateTextCacheAfter(Math.max(updatedTextEnd, mExpectedComposingEnd - textLengthChange));
-                        //TODO: I'm not sure I believe this^ is correct - validate. current tests pass
-                        // in either case, so it might be better to go with the safer option
-                        mState.invalidateTextCacheAfterAbsolute(updatedTextEnd - 1);
-                    } else {
-                        // even if the updated text ends at the selection end, there isn't a way to
-                        // determine if text only changed before the selection end. if text changed
-                        // past the selection end, we don't have any reference to determine if that
-                        // was from a change we made and accounted for or if there was some external
-                        // change that could make some of our cached text now shifted, so we'll just
-                        // need to clear anything after it to be safe
-                        testLog(TAG, "onUpdateExtractedText: invalidateTextCacheAfter "
-                                + (updatedTextEnd - 1) + " - unsure state clear after partial update (reduction)");
-                        mState.invalidateTextCacheAfterAbsolute(updatedTextEnd - 1);
-                    }
-                } else if (textLengthChange == 0) {
-                    // since the text isn't changing length, it's safe to keep whatever is in the cache
-                } else /*textLengthChange > 0*/ {
-                    if (updatedTextEnd == mState.getSelectionEnd() && !unexpectedCursorChange) {
-                        // we already knew about the change and nothing was actually changed after
-                        // the end of the selection, so text after the selection is safe to keep
-                    } else {
-                        // since we don't know if this change is from some external source of an
-                        // alteration of what we requested to add, we don't know how much text after
-                        // this change needs to shift, so the cache after this point could be
-                        // inaccurate
-                        testLog(TAG, "onUpdateExtractedText: invalidateTextCacheAfter "
-                                + (updatedTextEnd - 1) + " - unsure state clear after partial update (increase)");
-                        mState.invalidateTextCacheAfterAbsolute(updatedTextEnd - 1);
+                    if (textLengthChange < 0) {
+                        if (composingSpanEnd > updatedTextEnd) {
+                            // since we know how much text is getting removed, we can at least be sure that
+                            // the new full text's length isn't less than this change removed from the
+                            // furthest known position
+                            testLog(TAG, "onUpdateExtractedText: invalidateTextCacheAfter "
+                                    + /*Math.max(updatedTextEnd, composingSpanEnd - textLengthChange)*/(updatedTextEnd - 1)
+                                    + " - clear based on composing end in partial update");
+//                            invalidateTextCacheAfter(Math.max(updatedTextEnd, mExpectedComposingEnd - textLengthChange));
+                            //TODO: I'm not sure I believe this^ is correct - validate. current tests pass
+                            // in either case, so it might be better to go with the safer option
+                            mState.invalidateTextCacheAfterAbsolute(updatedTextEnd - 1);
+                        } else {
+                            // even if the updated text ends at the selection end, there isn't a way to
+                            // determine if text only changed before the selection end. if text changed
+                            // past the selection end, we don't have any reference to determine if that
+                            // was from a change we made and accounted for or if there was some external
+                            // change that could make some of our cached text now shifted, so we'll just
+                            // need to clear anything after it to be safe
+                            testLog(TAG, "onUpdateExtractedText: invalidateTextCacheAfter "
+                                    + (updatedTextEnd - 1) + " - unsure state clear after partial update (reduction)");
+                            mState.invalidateTextCacheAfterAbsolute(updatedTextEnd - 1);
+                        }
+                    } else if (textLengthChange == 0) {
+                        // since the text isn't changing length, it's safe to keep whatever is in the cache
+                    } else /*textLengthChange > 0*/ {
+                        if (updatedTextEnd == mState.getSelectionEnd() && !unexpectedCursorChange) {
+                            // we already knew about the change and nothing was actually changed after
+                            // the end of the selection, so text after the selection is safe to keep
+                        } else {
+                            // since we don't know if this change is from some external source of an
+                            // alteration of what we requested to add, we don't know how much text after
+                            // this change needs to shift, so the cache after this point could be
+                            // inaccurate
+                            testLog(TAG, "onUpdateExtractedText: invalidateTextCacheAfter "
+                                    + (updatedTextEnd - 1) + " - unsure state clear after partial update (increase)");
+                            mState.invalidateTextCacheAfterAbsolute(updatedTextEnd - 1);
+                        }
                     }
                 }
             }
+
+            if (!textTaken) {
+                testLog(TAG, "onUpdateExtractedText: updateTextCache before " + mState.getDebugStateInternal());
+                testLog(TAG, "onUpdateExtractedText: updateTextCache text=\"" + text.text + "\", offset=" + offset);
+                mState.updateTextCache(text.text, offset);
+                testLog(TAG, "onUpdateExtractedText: updateTextCache after " + mState.getDebugStateInternal());
+            }
+        } else if (takeSelectionUpdate) {
+            if (mState.getSelectionStart() != updatedSelectionStart
+                    || mState.getSelectionEnd() != updatedSelectionEnd) {
+                if (mState.getSelectionStart() != updatedSelectionStart) {
+                    mState.invalidateTextCache();
+                }
+                mState.setSelection(updatedSelectionStart, updatedSelectionEnd);
+                statePositionsChanged = true;
+            }
         }
 
-        mState.updateTextCache(text.text, offset);
+        if (appearsUpToDate != null && !appearsUpToDate) {
+            testLog(TAG, "onUpdateExtractedText: out-of-date update: statePositionsChanged=" + statePositionsChanged);
+        } else if (!statePositionsChanged) {
+            testLog(TAG, "onUpdateExtractedText: state positions didn't change, so considering expected");
+        }
         testLog(TAG, "onUpdateExtractedText: final " + mState.getDebugStateInternal());
         testLog(TAG, "onUpdateExtractedText: unexpectedCursorChange=" + !selectionMatches);
         return selectionMatches;
@@ -2606,6 +3767,302 @@ public final class RichInputConnection {
         return steps;
     }
 
+    // pairing actions and updates options
+    // 1. internal action, paired extracted text, paired selection
+    // 2. internal action, paired extracted text
+    //    unexpected selection (composition)
+    // 3. internal action
+    //    unexpected selection, paired extracted text
+    // 4. internal action
+    //    unexpected extracted text, paired selection
+    // 5. internal action, no paired selection (no change), maybe paired extracted text
+    private static class SelectionPositionStateV2 {
+        final int selectionStart;
+        final int selectionEnd;
+        Integer compositionStart;
+        Integer compositionEnd;
+        final long internalActionTime;
+        long selectionUpdateTime = 0;
+        long extractedTextUpdateTime = 0;
+        final boolean expectSelectionUpdate;
+        final boolean expectExtractedTextUpdate;
+        //TODO: (EW) do we need separate ones for the 2 update types?
+        Boolean updateAppearsUpToDate;
+        boolean expectedSelectionAlreadyMatched;
+        boolean selectionTaken;
+        boolean selectionUpdateFullyTaken;
+        //TODO: (EW) maybe add a timestamp to use for clearing items from list (probably need since
+        // we won't get some updates) (probably still always want to keep the most recent actual
+        // update)
+        private SelectionPositionStateV2(final int selectionStart, final int selectionEnd,
+                                         final Integer compositionStart,
+                                         final Integer compositionEnd,
+                                         boolean isInternalAction,
+                                         boolean expectSelectionUpdate,
+                                         boolean isSelectionUpdate,
+                                         boolean selectionUpdateFullyTaken,
+                                         boolean expectExtractedTextUpdate,
+                                         boolean isExtractedTextUpdate,
+                                         boolean expectedSelectionAlreadyMatched,
+                                         boolean selectionTaken,
+                                         Boolean updateAppearsUpToDate) {
+            this.selectionStart = selectionStart;
+            this.selectionEnd = selectionEnd;
+            this.compositionStart = compositionStart;
+            this.compositionEnd = compositionEnd;
+            if (isInternalAction) {
+                internalActionTime = SystemClock.uptimeMillis();
+            } else {
+                internalActionTime = 0;
+            }
+            this.expectSelectionUpdate = expectSelectionUpdate;
+            if (isSelectionUpdate) {
+                selectionUpdateTime = SystemClock.uptimeMillis();
+            }
+            this.selectionUpdateFullyTaken = selectionUpdateFullyTaken;
+            this.expectExtractedTextUpdate = expectExtractedTextUpdate;
+            if (isExtractedTextUpdate) {
+                extractedTextUpdateTime = SystemClock.uptimeMillis();
+            }
+            this.expectedSelectionAlreadyMatched = expectedSelectionAlreadyMatched;
+            this.selectionTaken = selectionTaken;
+            this.updateAppearsUpToDate = updateAppearsUpToDate;
+        }
+
+        private void pairSelectionUpdate(Boolean appearsUpToDate) {
+            selectionUpdateTime = SystemClock.uptimeMillis();
+            if (updateAppearsUpToDate == null) {
+                updateAppearsUpToDate = appearsUpToDate;
+            }
+        }
+
+        private void pairExtractedTextUpdate(Boolean appearsUpToDate) {
+            extractedTextUpdateTime = SystemClock.uptimeMillis();
+            if (updateAppearsUpToDate == null) {
+                updateAppearsUpToDate = appearsUpToDate;
+            }
+        }
+
+        private boolean isInternalAction() {
+            return internalActionTime != 0;
+        }
+        private boolean isSelectionUpdate() {
+            return selectionUpdateTime != 0;
+        }
+        private boolean isExtractedTextUpdate() {
+            return extractedTextUpdateTime != 0;
+        }
+
+        private boolean updateAppearsUpToDate() {
+            return updateAppearsUpToDate != null && updateAppearsUpToDate;
+        }
+
+        private boolean updateAppearsOutOfDate() {
+            return updateAppearsUpToDate != null && !updateAppearsUpToDate;
+        }
+
+        public static SelectionPositionStateV2 internalAction(EditorState state,
+                                                              boolean expectSelectionUpdate,
+                                                              boolean expectExtractedTextUpdate) {
+            Integer compositionStart;
+            Integer compositionEnd;
+            if (state.isCompositionUnknown()) {
+                compositionStart = null;
+                compositionEnd = null;
+            } else {
+                compositionStart = state.getCompositionStart();
+                compositionEnd = state.getCompositionEnd();
+            }
+            return new SelectionPositionStateV2(state.getSelectionStart(), state.getSelectionEnd(),
+                    compositionStart, compositionEnd, true,
+                    expectSelectionUpdate, false, false,
+                    expectExtractedTextUpdate, false,
+                    false, false, null);
+        }
+
+        public static SelectionPositionStateV2 selectionUpdate(final int selectionStart,
+                                                               final int selectionEnd,
+                                                               final int compositionStart,
+                                                               final int compositionEnd,
+                                                               final Boolean appearsUpToDate,
+                                                               final boolean expectedSelectionAlreadyMatched,
+                                                               final boolean selectionTaken,
+                                                               final boolean selectionUpdateFullyTaken,
+                                                               final boolean expectExtractedTextUpdate) {
+            return new SelectionPositionStateV2(selectionStart, selectionEnd,
+                    compositionStart, compositionEnd, false,
+                    false, true, selectionUpdateFullyTaken,
+                    expectExtractedTextUpdate, false,
+                    expectedSelectionAlreadyMatched, selectionTaken, appearsUpToDate);
+        }
+
+        public static SelectionPositionStateV2 extractedTextUpdate(final int selectionStart,
+                                                                   final int selectionEnd,
+                                                                   final Boolean appearsUpToDate,
+                                                                   final boolean selectionTaken,
+                                                                   boolean expectSelectionUpdate) {
+            return new SelectionPositionStateV2(selectionStart, selectionEnd,
+                    null, null, false,
+                    expectSelectionUpdate, false, false,
+                    false, true,
+                    false, selectionTaken, appearsUpToDate);
+        }
+
+        public static SelectionPositionStateV2 reloadedSelection(final int selectionStart,
+                                                                 final int selectionEnd) {
+            return new SelectionPositionStateV2(selectionStart, selectionEnd,
+                    null, null, false,
+                    false, false, false,
+                    false, false,
+                    false, true, null);
+        }
+
+        @Override
+        public String toString() {
+            StringBuilder sb = new StringBuilder();
+            if (isInternalAction()) {
+                sb.append("InternalAction");
+                if (selectionUpdateTime > 0 && (extractedTextUpdateTime == 0
+                        || selectionUpdateTime < extractedTextUpdateTime)) {
+                    sb.append("+SelectionUpdate");
+                }
+                if (extractedTextUpdateTime > 0) {
+                    sb.append("+ExtractedTextUpdate");
+                }
+                if (selectionUpdateTime > 0 && extractedTextUpdateTime > 0
+                        && selectionUpdateTime >= extractedTextUpdateTime) {
+                    sb.append("+SelectionUpdate");
+                }
+            }
+            sb.append(": selStart=").append(selectionStart);
+            sb.append(", selEnd=").append(selectionEnd);
+            if (isInternalAction() || isSelectionUpdate()) {
+                sb.append(", compStart=").append(selectionEnd);
+                sb.append(", compEnd=").append(selectionEnd);
+            }
+            if (!isSelectionUpdate()) {
+                sb.append(", expectSelectionUpdate=").append(expectSelectionUpdate);
+            }
+            if (!isExtractedTextUpdate()) {
+                sb.append(", expectExtractedTextUpdate=").append(expectExtractedTextUpdate);
+            }
+            if (isSelectionUpdate() || isExtractedTextUpdate()) {
+                sb.append(", updateAppearsUpToDate=").append(updateAppearsUpToDate);
+            }
+            return sb.toString();
+        }
+    }
+
+    private static class SelectionPositionState {
+        protected final int selectionStart;
+        protected final int selectionEnd;
+        //TODO: (EW) maybe add a timestamp to use for clearing items from list (probably need since
+        // we won't get some updates) (probably still always want to keep the most recent actual
+        // update)
+        SelectionPositionState(final int selectionStart, final int selectionEnd) {
+            this.selectionStart = selectionStart;
+            this.selectionEnd = selectionEnd;
+        }
+    }
+    private static class InternalActionEndState extends SelectionPositionState {
+        final Integer compositionStart;
+        final Integer compositionEnd;
+        final long actionTime = SystemClock.uptimeMillis();
+        long selectionUpdateTime = 0;
+        long extractedTextUpdateTime = 0;
+        final boolean expectExtractedTextUpdate;
+        InternalActionEndState(final int selectionStart, final int selectionEnd,
+                               final Integer compositionStart, final Integer compositionEnd,
+                               boolean expectExtractedTextUpdate) {
+            super(selectionStart, selectionEnd);
+            this.compositionStart = compositionStart;
+            this.compositionEnd = compositionEnd;
+            this.expectExtractedTextUpdate = expectExtractedTextUpdate;
+        }
+        InternalActionEndState(EditorState state, boolean expectExtractedTextUpdate) {
+            super(state.getSelectionStart(), state.getSelectionEnd());
+            if (state.isCompositionUnknown()) {
+                this.compositionStart = null;
+                this.compositionEnd = null;
+            } else {
+                this.compositionStart = state.getCompositionStart();
+                this.compositionEnd = state.getCompositionEnd();
+            }
+            this.expectExtractedTextUpdate = expectExtractedTextUpdate;
+        }
+
+        @Override
+        public String toString() {
+            return "InternalActionEndState(selStart=" + selectionStart + ", selEnd=" + selectionEnd
+                    + ", compStart" + compositionStart + ", compEnd=" + compositionEnd
+                    + ", updateReceived=" + (selectionUpdateTime > 0) + ")";
+        }
+    }
+    private static class ReloadedSelectionPositionState extends SelectionPositionState {
+        ReloadedSelectionPositionState(final int selectionStart, final int selectionEnd) {
+            super(selectionStart, selectionEnd);
+        }
+
+        @Override
+        public String toString() {
+            return "ReloadedSelectionPositionState(selStart=" + selectionStart
+                    + ", selEnd=" + selectionEnd + ")";
+        }
+    }
+    private static abstract class UpdatePositionState extends SelectionPositionState {
+        final Boolean appearsUpToDate;
+        final boolean selectionTaken;
+        UpdatePositionState(final int selectionStart, final int selectionEnd,
+                            final Boolean appearsUpToDate, final boolean selectionTaken) {
+            super(selectionStart, selectionEnd);
+            this.appearsUpToDate = appearsUpToDate;
+            this.selectionTaken = selectionTaken;
+        }
+    }
+    //TODO: (EW) since we flag InternalActionEndState with the update that matches, these are
+    // fundamentally unexpected updates. maybe rename
+    // actually these may also contain updates that aren't entirely unexpected, but simply that we
+    // didn't know where some positions were going to be.
+    private static class SelectionUpdateState extends UpdatePositionState {
+        final int compositionStart;
+        final int compositionEnd;
+        final boolean expectedSelectionAlreadyMatched;
+        boolean updateFullyTaken;
+        SelectionUpdateState(final int selectionStart, final int selectionEnd,
+                             final int compositionStart, final int compositionEnd,
+                             final Boolean appearsUpToDate,
+                             final boolean expectedSelectionAlreadyMatched,
+                             final boolean selectionTaken) {
+            super(selectionStart, selectionEnd, appearsUpToDate, selectionTaken);
+            this.compositionStart = compositionStart;
+            this.compositionEnd = compositionEnd;
+            this.expectedSelectionAlreadyMatched = expectedSelectionAlreadyMatched;
+        }
+
+        @Override
+        public String toString() {
+            return "SelectionUpdateState(selStart=" + selectionStart + ", selEnd=" + selectionEnd
+                    + ", compStart" + compositionStart + ", compEnd=" + compositionEnd
+                    + ", appearsUpToDate=" + appearsUpToDate
+                    + ", expectedMatched=" + expectedSelectionAlreadyMatched
+                    + ", selectionTaken=" + selectionTaken
+                    + ", updateFullyTaken=" + updateFullyTaken + ")";
+        }
+    }
+    private static class ExtractedTextUpdateState extends UpdatePositionState {
+        boolean textUpdateTaken;
+        ExtractedTextUpdateState(final int selectionStart, final int selectionEnd,
+                                 final Boolean appearsUpToDate, final boolean selectionTaken) {
+            super(selectionStart, selectionEnd, appearsUpToDate, selectionTaken);
+        }
+
+        @Override
+        public String toString() {
+            return "ExtractedTextUpdateState(selStart=" + selectionStart
+                    + ", selEnd=" + selectionEnd + ", appearsUpToDate=" + appearsUpToDate + ")";
+        }
+    }
+
     //#region TODO: delete contents of this region
     //#region old APIs scheduled for deletion
     // these are temporarily kept to allow the existing unit tests for them to continue indirectly
@@ -2641,31 +4098,38 @@ public final class RichInputConnection {
                         " change what text is getting deleted, so the composition will be" +
                         " finished to avoid an deleting an unexpected part of the text.");
                 mState.finishComposingText();
+                prepSendAction();
                 mIC.finishComposingText();
                 mState.deleteTextBeforeCursor(beforeLength);
+                prepSendAction();
                 mIC.deleteSurroundingText(beforeLength, 0);
             } else if (mState.hasComposition()) {
-                if (!mState.isCompositionRelativePositionKnown()) {
+                if (!mState.isRelativeCompositionPositionKnown()) {
                     Log.w(TAG, "deleteTextBeforeCursor was called without knowing the relative" +
                             " position of the composition. depending on where the composition is," +
                             " it might change what text is getting deleted, so the composition" +
                             " will be finished to avoid an deleting an unexpected part of the" +
                             " text.");
                     mState.finishComposingText();
+                    prepSendAction();
                     mIC.finishComposingText();
                     mState.deleteTextBeforeCursor(beforeLength);
+                    prepSendAction();
                     mIC.deleteSurroundingText(beforeLength, 0);
                 } else if (mState.getRelativeCompositionStart() >= 0) {
                     // safe to do a simple delete
                     mState.deleteTextBeforeCursor(beforeLength);
+                    prepSendAction();
                     mIC.deleteSurroundingText(beforeLength, 0);
                 } else if (mState.getRelativeCompositionStart() >= -beforeLength
                         && mState.getRelativeCompositionEnd() <= 0) {
                     // the whole composition is getting deleted, so just drop the composition and
                     // delete
                     mState.finishComposingText();
+                    prepSendAction();
                     mIC.finishComposingText();
                     mState.deleteTextBeforeCursor(beforeLength);
+                    prepSendAction();
                     mIC.deleteSurroundingText(beforeLength, 0);
                 } else if (!mState.areSelectionAbsolutePositionsKnown()) {
                     //TODO: (EW) I don't think this case is relevant if we set the composing text
@@ -2677,8 +4141,10 @@ public final class RichInputConnection {
                             " be finished to avoid an deleting an unexpected part of the" +
                             " text.");
                     mState.finishComposingText();
+                    prepSendAction();
                     mIC.finishComposingText();
                     mState.deleteTextBeforeCursor(beforeLength);
+                    prepSendAction();
                     mIC.deleteSurroundingText(beforeLength, 0);
                 } else {
                     final int initialExpectedSelStart = mState.getSelectionStart();
@@ -2690,12 +4156,15 @@ public final class RichInputConnection {
                     if (initialExpectedComposingEnd <= deleteStart) {
                         // deleting exclusively after the composition
                         mState.setSelection(deleteStart, deleteStart);
+                        prepSendAction();
                         mIC.setSelection(deleteStart, deleteStart);
                         mState.deleteTextAfterCursor(beforeLength);
+                        prepSendAction();
                         mIC.deleteSurroundingText(0, beforeLength);
                         if (initialExpectedSelLength > 0) {
                             mState.setSelection(deleteStart,
                                     deleteStart + initialExpectedSelLength);
+                            prepSendAction();
                             mIC.setSelection(deleteStart, deleteStart + initialExpectedSelLength);
                         }
                     } else {
@@ -2714,11 +4183,13 @@ public final class RichInputConnection {
                         // expected text is deleted
                         mState.finishComposingText();
                         testLog(TAG, "deleteTextBeforeCursor: calling finishComposingText()");
+                        prepSendAction();
                         mIC.finishComposingText();// this may be expensive with some editors
 
                         mState.deleteTextBeforeCursor(beforeLength);
                         testLog(TAG, "deleteTextBeforeCursor: calling deleteSurroundingText("
                                 + beforeLength + ", 0)");
+                        prepSendAction();
                         mIC.deleteSurroundingText(beforeLength, 0);
 
                         final int finalSelectionStart = mState.getSelectionStart();
@@ -2757,6 +4228,7 @@ public final class RichInputConnection {
                             // maybe we have to just assume that it worked and move on.
                             //TODO: (EW) prior to Nougat, calling this may crash the application, so
                             // should we avoid calling it on older versions to be safe?
+                            prepSendAction();
                             if (!mIC.setComposingRegion(finalCompositionStart, finalCompositionEnd)) {
                                 // some input connections don't support setComposingRegion so we'll
                                 // have to do it manually
@@ -2803,6 +4275,7 @@ public final class RichInputConnection {
                                             finalCompositionEnd - mState.getSelectionEnd());
                                     testLog(TAG, "deleteTextBeforeCursor: calling setSelection("
                                             + finalCompositionEnd + ", " + finalCompositionEnd + ")");
+                                    prepSendAction();
                                     mIC.setSelection(finalCompositionEnd, finalCompositionEnd);
 
                                     // delete the committed text that should be the composing text so it
@@ -2810,6 +4283,7 @@ public final class RichInputConnection {
                                     mState.deleteTextBeforeCursor(newComposingLength);
                                     testLog(TAG, "deleteTextBeforeCursor: calling deleteSurroundingText("
                                             + newComposingLength + ", 0)");
+                                    prepSendAction();
                                     mIC.deleteSurroundingText(newComposingLength, 0);
 
                                     // add the composition back and move the cursor to where the main
@@ -2839,12 +4313,14 @@ public final class RichInputConnection {
                                     testLog(TAG, "deleteTextBeforeCursor: calling setComposingText("
                                             + mState.getComposedText()
                                             + ", " + newCursorPosition + ")");
+                                    prepSendAction();
                                     mIC.setComposingText(newComposition, newCursorPosition);
                                     if (!mState.selectionMatches(finalSelectionStart,
                                             finalSelectionEnd, false)) {
                                         mState.setSelection(finalSelectionStart, finalSelectionEnd);
                                         testLog(TAG, "deleteTextBeforeCursor: calling setSelection("
                                                 + finalSelectionStart + ", " + finalSelectionEnd + ")");
+                                        prepSendAction();
                                         mIC.setSelection(finalSelectionStart, finalSelectionEnd);
                                     }
                                 } else {
@@ -2861,6 +4337,7 @@ public final class RichInputConnection {
                 }
             } else {
                 mState.deleteTextBeforeCursor(beforeLength);
+                prepSendAction();
                 mIC.deleteSurroundingText(beforeLength, 0);
             }
         }
@@ -2918,7 +4395,7 @@ public final class RichInputConnection {
     // the flags parameter for spans
     private CharSequence loadCompositionWithStyles() {
         if (mState.isCompositionUnknown() || !mState.hasComposition()
-                || !mState.isCompositionRelativePositionKnown()
+                || !mState.isRelativeCompositionPositionKnown()
                 || (!mState.isSelectionLengthKnown()
                 && mState.getCompositionEnd() > 0)) {
             // either there is no composition or we don't know how to load the text

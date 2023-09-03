@@ -162,7 +162,7 @@ public class EditorState {
         if (isAbsoluteSelectionStartKnown()) {
             spaceBefore = mSelectionStart - mTextCache.mIndex;
         } else if (!isCompositionUnknown() && hasComposition()
-                && isCompositionRelativePositionKnown() && mCompositionRelativeStartIndex < 0) {
+                && isRelativeCompositionPositionKnown() && mCompositionRelativeStartIndex < 0) {
             spaceBefore = Math.max(0, -mCompositionRelativeStartIndex - mTextCache.mIndex);
         } else {
             spaceBefore = Math.max(0, -mTextCache.mIndex);
@@ -177,7 +177,7 @@ public class EditorState {
                 spaceAfter = mTextCache.mIndex - mTextCache.mStringBuilder.length();
             }
         }
-        if (!isCompositionUnknown() && hasComposition() && isCompositionRelativePositionKnown()) {
+        if (!isCompositionUnknown() && hasComposition() && isRelativeCompositionPositionKnown()) {
             spaceAfter = Math.max(spaceAfter,
                     mCompositionRelativeStartIndex + mTextCache.mIndex
                             - mTextCache.mStringBuilder.length());
@@ -190,7 +190,7 @@ public class EditorState {
             state += "\n" + indent + " " + repeatChar('?',
                     spaceBefore + mTextCache.mStringBuilder.length() + spaceAfter);
         } else if (hasComposition()) {
-            if (isCompositionRelativePositionKnown()) {
+            if (isRelativeCompositionPositionKnown()) {
                 state += "\n" + indent + " " + repeatChar(' ',
                         spaceBefore + mTextCache.mIndex + mCompositionRelativeStartIndex)
                         + repeatChar('_', mCompositionLength);
@@ -352,16 +352,6 @@ public class EditorState {
         }
         //TODO: (EW) it might not be necessary to bother checking the start index here
         return mCompositionLength > 0 || mCompositionRelativeStartIndex != null;
-    }
-
-    /**
-     * Check if the composition relative start/end position is known.
-     * @return Whether the composition relative positions are known.
-     */
-    public boolean isCompositionRelativePositionKnown() {
-        // if we have a relative start position, we should have a length, so that's not necessary to
-        // check
-        return mCompositionRelativeStartIndex != null;
     }
 
     /**
@@ -628,6 +618,9 @@ public class EditorState {
      * @param shift The number of characters to shift both the start and end of the selection.
      */
     public void shiftSelection(int shift) {
+        if (shift == 0) {
+            return;
+        }
         mTextCache.shift(shift);
         if (isAbsoluteSelectionStartKnown()) {
             if (mSelectionStart + shift < 0) {
@@ -929,7 +922,7 @@ public class EditorState {
                 + "\", mHoleyTextCacheCursorStartIndex=" + mTextCache.mIndex
                 + ", discarding=\""
                 + mTextCache.subSequence(startPositionFromCursorStart,
-                endPositionFromCursorStart + 1, false)
+                        endPositionFromCursorStart + 1, false)
                 + "\"");
         return mTextCache.clearRange(startPositionFromCursorStart, endPositionFromCursorStart);
     }
@@ -944,6 +937,8 @@ public class EditorState {
      */
     public void updateTextCache(final CharSequence text, final int absoluteOffset) {
         if (!isAbsoluteSelectionStartKnown()) {
+            testLog(TAG, "updateTextCache text=\"" + text + "\", offset=" + absoluteOffset
+                    + " - can't update because absolute selection start isn't known");
             return;
         }
         updateTextCacheRelative(text, absoluteOffset - mSelectionStart);
@@ -989,6 +984,7 @@ public class EditorState {
             mTextCache.clear();
             return;
         }
+        final int textLengthChange = text.length() - (absoluteEnd - absoluteStart);
         final int startOffsetFromCursorStart = absoluteStart - mSelectionStart;
         final int endOffsetFromCursorStart = absoluteEnd - mSelectionStart;
         if (!isCompositionUnknown() && hasComposition()) {
@@ -1003,7 +999,7 @@ public class EditorState {
                         && endOffsetFromCursorStart <= mCompositionRelativeStartIndex + mCompositionLength) {
                     // replacement is entirely within the composition, so the composition length
                     // needs to shift for the change of text
-                    mCompositionLength += text.length() - (absoluteEnd - absoluteStart);
+                    mCompositionLength += textLengthChange;
                 } else {
                     // replacement is through the edge of the composition and there is no
                     // indication of how that impacts the composition, so we need to reset to an
@@ -1027,13 +1023,32 @@ public class EditorState {
             // start
             if (startOffsetFromCursorStart >= mCompositionRelativeStartIndex + mCompositionLength
                     && endOffsetFromCursorStart <= 0) {
-                mCompositionRelativeStartIndex -= text.length() - (absoluteEnd - absoluteStart);
+                mCompositionRelativeStartIndex -= textLengthChange;
             } else if (startOffsetFromCursorStart >= 0
                     && endOffsetFromCursorStart <= mCompositionRelativeStartIndex) {
-                mCompositionRelativeStartIndex += text.length() - (absoluteEnd - absoluteStart);
+                mCompositionRelativeStartIndex += textLengthChange;
             }
         }
         mTextCache.replace(startOffsetFromCursorStart, endOffsetFromCursorStart, text);
+        // update the selection since replace doesn't do it
+        if (endOffsetFromCursorStart < 0) {
+            mTextCache.shift(textLengthChange);
+            if (isAbsoluteSelectionStartKnown()) {
+                if (mSelectionStart + textLengthChange < 0) {
+                    Log.e(TAG, "Shifting selection past 0");
+                    //textLengthChange = -mSelectionStart;
+                    //TODO: (EW) probably remove - keeping for now to catch any of these issues
+                    // before release
+                    throw new IllegalArgumentException("Shifting selection past 0");
+                }
+                mSelectionStart += textLengthChange;
+            }
+        } else if (endOffsetFromCursorStart < mSelectionLength) {
+            shiftSelection(0, textLengthChange);
+        } else if (startOffsetFromCursorStart < mSelectionLength
+                && endOffsetFromCursorStart > mSelectionLength) {
+            invalidateSelection(false, true);
+        }
     }
     //#endregion
 
@@ -1092,7 +1107,7 @@ public class EditorState {
             // position as a reference needs to be reset to an unknown state
             invalidateSelection(true, mSelectionLength > 0);
             if (!isCompositionUnknown() && hasComposition()) {
-                invalidateComposition(!isCompositionRelativePositionKnown()
+                invalidateComposition(!isRelativeCompositionPositionKnown()
                         || mCompositionRelativeStartIndex + mCompositionLength > relativeStartIndex);
             }
             mTextCache.clear();
@@ -1124,7 +1139,7 @@ public class EditorState {
 
         // update the composition state if there is a known composition
         if (!isCompositionUnknown() && hasComposition()) {
-            if (!isCompositionRelativePositionKnown()) {
+            if (!isRelativeCompositionPositionKnown()) {
                 // we don't know how this may impact the composition since we don't even know where
                 // it is, so reset to an unknown state
                 testLog(TAG, "replaceText: invalidateComposition - unknown relative composition");
@@ -1198,7 +1213,7 @@ public class EditorState {
         }
         if (replaceRelativeStartIndex + replaceLength < relativePosition
                 || (replaceRelativeStartIndex + replaceLength == relativePosition
-                && replaceLength > 0)) {
+                        && replaceLength > 0)) {
             // the position is after or at the end of the replaced text, so it shifts by the change
             // in text length
             return newTextLength - replaceLength;

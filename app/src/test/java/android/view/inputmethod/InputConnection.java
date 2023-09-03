@@ -5,7 +5,7 @@ import android.os.Handler;
 import android.view.KeyEvent;
 
 public interface InputConnection {
-    static final int GET_TEXT_WITH_STYLES = 0x0001;
+    public static final int GET_TEXT_WITH_STYLES = 1;
     public static final int GET_EXTRACTED_TEXT_MONITOR = 1;
     public CharSequence getTextBeforeCursor(int i, int i1);
     public CharSequence getTextAfterCursor(int i, int i1);

@@ -16,8 +16,6 @@
 
 package rkr.simplekeyboard.inputmethod.latin.inputlogic;
 
-import static rkr.simplekeyboard.inputmethod.latin.RichInputConnection.testLog;
-
 import android.os.SystemClock;
 import android.text.TextUtils;
 import android.view.KeyCharacterMap;
@@ -37,6 +35,10 @@ import rkr.simplekeyboard.inputmethod.latin.settings.SettingsValues;
 import rkr.simplekeyboard.inputmethod.latin.utils.InputTypeUtils;
 import rkr.simplekeyboard.inputmethod.latin.utils.RecapitalizeStatus;
 import rkr.simplekeyboard.inputmethod.latin.utils.SubtypeLocaleUtils;
+
+import static rkr.simplekeyboard.inputmethod.latin.RichInputConnection.UPDATE_IMPACTED_SELECTION;
+import static rkr.simplekeyboard.inputmethod.latin.RichInputConnection.UPDATE_WAS_EXPECTED;
+import static rkr.simplekeyboard.inputmethod.latin.RichInputConnection.testLog;
 
 /**
  * This class manages the input logic.
@@ -128,8 +130,14 @@ public final class InputLogic {
                         + ", newSelStart=" + newSelStart
                         + ", expSelEnd=" + mConnection.getExpectedSelectionEnd()
                         + ", newSelEnd=" + newSelEnd);
-        if (!mConnection.onUpdateSelection(oldSelStart, oldSelEnd, newSelStart, newSelEnd,
-                composingSpanStart, composingSpanEnd)) {
+        int updateResult = mConnection.onUpdateSelection(oldSelStart, oldSelEnd, newSelStart, newSelEnd,
+                composingSpanStart, composingSpanEnd);
+        boolean updateImpactedSelection = (updateResult & UPDATE_IMPACTED_SELECTION) > 0;
+        boolean updateExpected = (updateResult & UPDATE_WAS_EXPECTED) > 0;
+        testLog("InputLogic", "onUpdateSelection: updateImpactedSelection="
+                + updateImpactedSelection + ", updateExpected=" + updateExpected);
+        //TODO: (EW) which (or both) should we care about?
+        if (updateImpactedSelection || !updateExpected) {
             testLog("InputLogic", "onUpdateSelection unexpected change");
 
             //TODO: (EW) does this always need to happen? - currently this seems to just reset

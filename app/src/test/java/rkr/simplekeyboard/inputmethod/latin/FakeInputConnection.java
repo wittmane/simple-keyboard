@@ -30,6 +30,7 @@ import android.view.inputmethod.InputConnection;
 import android.view.inputmethod.InputContentInfo;
 
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 
@@ -81,17 +82,21 @@ public class FakeInputConnection implements InputConnection {
                 + "\n  mGetSelectedTextSupported=" + mSettings.getSelectedTextSupported
                 + "\n  mDeleteAroundComposingText=" + mSettings.deleteAroundComposingText
                 + "\n  mKeepEmptyComposingPosition=" + mSettings.keepEmptyComposingPosition
-                + "\n  mTextModifier=" + mSettings.textModifier
+                + "\n  textModifiers=" + Arrays.toString(mSettings.textModifiers)
                 + "\n  mAllowGettingText=" + mAllowGettingText
                 + "\n  mAllowExtractingText=" + mSettings.allowExtractingText
                 + "\n  mExtractTextLimit=" + mSettings.extractTextLimit
                 + "\n  mExtractTextLimitedTarget=" + mSettings.extractTextLimitedTarget
-//                + "\n  mOnlyUpdateOnChange=" + mSettings.onlyUpdateOnChange
                 + "\n  mPartialTextMonitorUpdates=" + mSettings.partialTextMonitorUpdates
                 + "\n  mExtractMonitorTextLimit=" + mSettings.extractMonitorTextLimit
-                + "\n  mUpdateSelectionAfterExtractedText=" + mSettings.updateSelectionAfterExtractedText
+                + "\n  mUpdateSelectionAfterExtractedText="
+                + mSettings.updateSelectionAfterExtractedText
                 + "\n  mDropSelectionAfterExtractedTextMonitorRequest="
-                + mSettings.dropSelectionAfterExtractedTextMonitorRequest;
+                + mSettings.dropSelectionAfterExtractedTextMonitorRequest
+                + "\n  sendSelectionUpdateWhenNotChanged="
+                + mSettings.sendSelectionUpdateWhenNotChanged
+                + "\n  sendExtractedTextUpdateBasedOnNetTextChange="
+                + mSettings.sendExtractedTextUpdateBasedOnNetTextChange;
     }
 
     //TODO: (EW) remove - only used in old tests
@@ -163,12 +168,19 @@ public class FakeInputConnection implements InputConnection {
         private boolean deleteAroundComposingText = false;
         private boolean keepEmptyComposingPosition = false;
         //TODO: (EW) make private
-        FakeInputConnection.TextModifier textModifier = /*new NoTextModifier()*/null;
+        FakeInputConnection.TextModifier[] textModifiers = new TextModifier[0];
         //TODO: (EW) make private
         boolean allowExtractingText = true;
         //TODO: (EW) make private
         int extractTextLimit = Integer.MAX_VALUE;
         private int extractTextLimitedTarget = EXTRACT_TEXT_CENTERED_ON_SELECTION;
+        //TODO: (EW) I don't think it's valid for an editor to just ignore this flag if it does
+        // support extracting text normally, so this probably should be removed. it's useful for now
+        // to skip that update to simplify/isolate the test for delayed updates and works to
+        // simulate the case where we don't request these updates yet. especially once everything is
+        // developed, it might be better to not test this fake case or find a better way to test
+        // something similar.
+        private boolean allowExtractedTextMonitor = true;
         //TODO: maybe the default should be full updates to fit limitReturnedText better, rather
         // than match what the default EditText does
         //TODO: (EW) make private
@@ -177,8 +189,11 @@ public class FakeInputConnection implements InputConnection {
         //TODO: (EW) make private
         boolean updateSelectionAfterExtractedText = true;
         private boolean dropSelectionAfterExtractedTextMonitorRequest = true;
-        //TODO: (EW) use this
-        private final boolean onlyUpdateOnChange = false;
+        //TODO: (EW) I'm not sure if using this is valid since the framework itself seems to block
+        // duplicate updates
+        private boolean sendSelectionUpdateWhenNotChanged = false;
+        //TODO: (EW) this probably should be false to match the framework as a default
+        private boolean sendExtractedTextUpdateBasedOnNetTextChange = true;
 
         public VariableBehaviorSettings() {
         }
@@ -189,14 +204,19 @@ public class FakeInputConnection implements InputConnection {
             getSelectedTextSupported = copy.getSelectedTextSupported;
             deleteAroundComposingText = copy.deleteAroundComposingText;
             keepEmptyComposingPosition = copy.keepEmptyComposingPosition;
-            textModifier = copy.textModifier;
+            textModifiers = copy.textModifiers;
             allowExtractingText = copy.allowExtractingText;
             extractTextLimit = copy.extractTextLimit;
             extractTextLimitedTarget = copy.extractTextLimitedTarget;
+            allowExtractedTextMonitor = copy.allowExtractedTextMonitor;
             partialTextMonitorUpdates = copy.partialTextMonitorUpdates;
             extractMonitorTextLimit = copy.extractMonitorTextLimit;
             updateSelectionAfterExtractedText = copy.updateSelectionAfterExtractedText;
-            dropSelectionAfterExtractedTextMonitorRequest = copy.dropSelectionAfterExtractedTextMonitorRequest;
+            dropSelectionAfterExtractedTextMonitorRequest =
+                    copy.dropSelectionAfterExtractedTextMonitorRequest;
+            sendSelectionUpdateWhenNotChanged = copy.sendSelectionUpdateWhenNotChanged;
+            sendExtractedTextUpdateBasedOnNetTextChange =
+                    copy.sendExtractedTextUpdateBasedOnNetTextChange;
         }
 
         public VariableBehaviorSettings blockBaseExtractText() {
@@ -212,6 +232,15 @@ public class FakeInputConnection implements InputConnection {
                                                            final int contentToExtract) {
             extractTextLimit = textLimit;
             extractTextLimitedTarget = contentToExtract;
+            return this;
+        }
+
+        public VariableBehaviorSettings blockExtractedTextMonitor() {
+            return allowExtractedTextMonitor(false);
+        }
+
+        public VariableBehaviorSettings allowExtractedTextMonitor(boolean allow) {
+            allowExtractedTextMonitor = allow;
             return this;
         }
 
@@ -291,13 +320,33 @@ public class FakeInputConnection implements InputConnection {
         }
 
         public VariableBehaviorSettings setTextModifier(final TextModifier textModifier) {
-//            this.textModifier = textModifier == null ? new NoTextModifier() : textModifier;
-            this.textModifier = textModifier;
+            return setTextModifiers(textModifier == null
+                    ? null
+                    : new TextModifier[] {textModifier});
+        }
+
+        public VariableBehaviorSettings setTextModifiers(final TextModifier[] textModifiers) {
+            this.textModifiers = textModifiers == null ? new TextModifier[0] : textModifiers;
             return this;
         }
 
-        public VariableBehaviorSettings forceDroppingSelectionAfterExtractedTextMonitorRequest(boolean dropSelectionAfterExtractedTextMonitorRequest) {
-            this.dropSelectionAfterExtractedTextMonitorRequest = dropSelectionAfterExtractedTextMonitorRequest;
+        public VariableBehaviorSettings forceDroppingSelectionAfterExtractedTextMonitorRequest(
+                boolean dropSelectionAfterExtractedTextMonitorRequest) {
+            this.dropSelectionAfterExtractedTextMonitorRequest =
+                    dropSelectionAfterExtractedTextMonitorRequest;
+            return this;
+        }
+
+        public VariableBehaviorSettings sendSelectionUpdateWhenNotChanged(
+                boolean sendSelectionUpdateWhenNotChanged) {
+            this.sendSelectionUpdateWhenNotChanged = sendSelectionUpdateWhenNotChanged;
+            return this;
+        }
+
+        public VariableBehaviorSettings sendExtractedTextUpdateBasedOnNetTextChange(
+                boolean sendExtractedTextUpdateBasedOnNetTextChange) {
+            this.sendExtractedTextUpdateBasedOnNetTextChange =
+                    sendExtractedTextUpdateBasedOnNetTextChange;
             return this;
         }
     }
@@ -306,14 +355,15 @@ public class FakeInputConnection implements InputConnection {
         return mSettings;
     }
 
-    //TODO: (EW) handle this better. not always forcing to be NoTextModifier instead of null due to
-    // checks accessing it in tests. maybe have a getter that returns null but internally uses
-    // NoTextModifier, or maybe just have the callers of this do null checks.
-    private TextModifier getTextModifier() {
-        if (mSettings.textModifier == null) {
-            return new NoTextModifier();
+    private CharSequence modifyText(CharSequence text, boolean isComposing) {
+        for (TextModifier textModifier : mSettings.textModifiers) {
+            if (isComposing) {
+                text = textModifier.modifyComposingText(text);
+            } else {
+                text = textModifier.modifyCommittingText(text);
+            }
         }
-        return mSettings.textModifier;
+        return text;
     }
 
     //TODO: merge with mGetTextLimit (maybe also take -1 to return null instead of empty string)
@@ -608,7 +658,7 @@ public class FakeInputConnection implements InputConnection {
         //Note: newCursorPosition is in characters, not code points
 
         handleEditStart();
-        text = getTextModifier().modifyComposingText(text);
+        text = modifyText(text, true);
         final int start;
         final int end;
         if (hasComposingText()) {
@@ -711,7 +761,7 @@ public class FakeInputConnection implements InputConnection {
     public boolean commitText(CharSequence text, int newCursorPosition) {
         //Note: newCursorPosition is in characters, not code points
 
-        text = getTextModifier().modifyCommittingText(text);
+        text = modifyText(text, false);
         handleEditStart();
         final int textStart;
         final int textInitialEnd;
@@ -828,28 +878,53 @@ public class FakeInputConnection implements InputConnection {
     }
 
     private void updateExtractedText() {
-        //TODO: maybe check mAllowExtractingText
+        Log.w("Fake", "updateExtractedText: allowExtractedTextMonitor=" + mSettings.allowExtractedTextMonitor);
+        if (!mSettings.allowExtractedTextMonitor) {
+            Log.w("Fake", "updateExtractedText: skipping update due to functionality being disabled");
+            return;
+        }
+        if (mExtractedTextMonitorRequests.size() == 0) {
+            return;
+        }
+
+        if (!mSettings.sendExtractedTextUpdateBasedOnNetTextChange) {
+            //TODO: (EW) implement to support sending updates based on modification action positions rather than net text change
+            throw new RuntimeException("Not implemented yet");
+        }
+
+        //TODO: (EW) mEditInitialText should be a Spannable so we can verify if spans changed to factor in the changed range
+        int startMatchLength = 0;
+        for (int i = 0; i < Math.min(mText.length(), mEditInitialText.length()); i++) {
+            if (mText.charAt(i) == mEditInitialText.charAt(i)) {
+                startMatchLength++;
+            } else {
+                break;
+            }
+        }
+        int endMatchLength = 0;
+        for (int i = 1; i <= Math.min(mText.length(), mEditInitialText.length()); i++) {
+            if (mText.charAt(mText.length() - i) == mEditInitialText.charAt(mEditInitialText.length() - i)) {
+                endMatchLength++;
+            } else {
+                break;
+            }
+        }
+        Log.w("Fake", "updateExtractedText: initialText=\"" + mEditInitialText
+                + "\", updatedText=\"" + mText + "\", startMatchLength=" + startMatchLength
+                + ", endMatchLength=" + endMatchLength);
+
+        if (startMatchLength == endMatchLength && endMatchLength == mEditInitialText.length()
+                && mEditInitialText.length() == mText.length()) {
+            Log.w("Fake", "updateExtractedText: skipping update due to unchanged text");
+            if (!mEditInitialText.equals(mText.toString())) {
+                throw new RuntimeException("text not actually equal");
+            }
+            return;
+        }
+
         for (final ExtractedTextRequest extractedTextRequest : mExtractedTextMonitorRequests.values()) {
             final ExtractedText extractedText = new ExtractedText();
-            int startMatchLength = 0;
-            for (int i = 0; i < Math.min(mText.length(), mEditInitialText.length()); i++) {
-                if (mText.charAt(i) == mEditInitialText.charAt(i)) {
-                    startMatchLength++;
-                } else {
-                    break;
-                }
-            }
-            int endMatchLength = 0;
-            for (int i = 1; i <= Math.min(mText.length(), mEditInitialText.length()); i++) {
-                if (mText.charAt(mText.length() - i) == mEditInitialText.charAt(mEditInitialText.length() - i)) {
-                    endMatchLength++;
-                } else {
-                    break;
-                }
-            }
-            Log.w("Fake", "handleEditEnd: initialText=\"" + mEditInitialText
-                    + "\", updatedText=\"" + mText + "\", startMatchLength=" + startMatchLength
-                    + ", endMatchLength=" + endMatchLength);
+
             if (mSettings.partialTextMonitorUpdates) {
                 final int initialTextMatchOverlap =
                         startMatchLength - (mEditInitialText.length() - endMatchLength);
@@ -858,6 +933,8 @@ public class FakeInputConnection implements InputConnection {
                 if (initialTextMatchOverlap > 0 || newTextMatchOverlap > 0) {
                     if (initialTextMatchOverlap == newTextMatchOverlap) {
                         // I think this means they are the same full text - verify that
+                        //TODO: (EW) if this is in fact due to no change, this shouldn't be able to
+                        // happen anymore due to the early exit, so this case could be removed
                         if (!mText.toString().equals(mEditInitialText)) {
                             //TODO: can this happen? what to do?
                             throw new RuntimeException("initialText=\"" + mEditInitialText
@@ -957,16 +1034,23 @@ public class FakeInputConnection implements InputConnection {
                 extractedText.selectionStart = mCurrentCursorStart - extractedText.startOffset;
                 extractedText.selectionEnd = mCurrentCursorEnd - extractedText.startOffset;
             }
-            //TODO: probably only call if there is a change based on a settings option
+
             mManager.updateExtractedText(null, extractedTextRequest.token, extractedText);
         }
     }
 
     private void updateSelection() {
-        //TODO: probably only call if there is a change based on a settings option
-        mManager.updateSelection(mEditInitialCursorStart, mEditInitialCursorEnd,
-                mCurrentCursorStart, mCurrentCursorEnd,
-                mCurrentComposingStart, mCurrentComposingEnd);
+        if (mSettings.sendSelectionUpdateWhenNotChanged
+                || mEditInitialCursorStart != mCurrentCursorStart
+                || mEditInitialCursorEnd != mCurrentCursorEnd
+                || mEditInitialComposingStart != mCurrentComposingStart
+                || mEditInitialComposingEnd != mCurrentComposingEnd) {
+            mManager.updateSelection(mEditInitialCursorStart, mEditInitialCursorEnd,
+                    mCurrentCursorStart, mCurrentCursorEnd,
+                    mCurrentComposingStart, mCurrentComposingEnd);
+        } else {
+            Log.w("Fake", "updateSelection: skipping update due to unchanged positions");
+        }
     }
 
     public void forceUpdateSelectionCall() {
@@ -1033,46 +1117,44 @@ public class FakeInputConnection implements InputConnection {
                     // keyEvent = codePoint - '0' + KeyEvent.KEYCODE_0
                     codePoint = '0' + keyEvent.getKeyCode() - KeyEvent.KEYCODE_0;
                     Log.w("Fake", getDebugState());
-                    setText(getTextModifier().modifyComposingText(
-                            new StringBuilder().appendCodePoint(codePoint)),
+                    setText(modifyText(new StringBuilder().appendCodePoint(codePoint), true),
                             mCurrentCursorStart, mCurrentCursorEnd);
                     mCurrentCursorStart = mCurrentCursorEnd;
                     Log.w("Fake", getDebugState());
                     break;
-            case KeyEvent.KEYCODE_A:
-            case KeyEvent.KEYCODE_B:
-            case KeyEvent.KEYCODE_C:
-            case KeyEvent.KEYCODE_D:
-            case KeyEvent.KEYCODE_E:
-            case KeyEvent.KEYCODE_F:
-            case KeyEvent.KEYCODE_G:
-            case KeyEvent.KEYCODE_H:
-            case KeyEvent.KEYCODE_I:
-            case KeyEvent.KEYCODE_J:
-            case KeyEvent.KEYCODE_K:
-            case KeyEvent.KEYCODE_L:
-            case KeyEvent.KEYCODE_M:
-            case KeyEvent.KEYCODE_N:
-            case KeyEvent.KEYCODE_O:
-            case KeyEvent.KEYCODE_P:
-            case KeyEvent.KEYCODE_Q:
-            case KeyEvent.KEYCODE_R:
-            case KeyEvent.KEYCODE_S:
-            case KeyEvent.KEYCODE_T:
-            case KeyEvent.KEYCODE_U:
-            case KeyEvent.KEYCODE_V:
-            case KeyEvent.KEYCODE_W:
-            case KeyEvent.KEYCODE_X:
-            case KeyEvent.KEYCODE_Y:
-            case KeyEvent.KEYCODE_Z:
-                codePoint = 'a' + keyEvent.getKeyCode() - KeyEvent.KEYCODE_A;
-                Log.w("Fake", getDebugState());
-                setText(getTextModifier().modifyComposingText(
-                        new StringBuilder().appendCodePoint(codePoint)),
-                        mCurrentCursorStart, mCurrentCursorEnd);
-                mCurrentCursorStart = mCurrentCursorEnd;
-                Log.w("Fake", getDebugState());
-                break;
+                case KeyEvent.KEYCODE_A:
+                case KeyEvent.KEYCODE_B:
+                case KeyEvent.KEYCODE_C:
+                case KeyEvent.KEYCODE_D:
+                case KeyEvent.KEYCODE_E:
+                case KeyEvent.KEYCODE_F:
+                case KeyEvent.KEYCODE_G:
+                case KeyEvent.KEYCODE_H:
+                case KeyEvent.KEYCODE_I:
+                case KeyEvent.KEYCODE_J:
+                case KeyEvent.KEYCODE_K:
+                case KeyEvent.KEYCODE_L:
+                case KeyEvent.KEYCODE_M:
+                case KeyEvent.KEYCODE_N:
+                case KeyEvent.KEYCODE_O:
+                case KeyEvent.KEYCODE_P:
+                case KeyEvent.KEYCODE_Q:
+                case KeyEvent.KEYCODE_R:
+                case KeyEvent.KEYCODE_S:
+                case KeyEvent.KEYCODE_T:
+                case KeyEvent.KEYCODE_U:
+                case KeyEvent.KEYCODE_V:
+                case KeyEvent.KEYCODE_W:
+                case KeyEvent.KEYCODE_X:
+                case KeyEvent.KEYCODE_Y:
+                case KeyEvent.KEYCODE_Z:
+                    codePoint = 'a' + keyEvent.getKeyCode() - KeyEvent.KEYCODE_A;
+                    Log.w("Fake", getDebugState());
+                    setText(modifyText(new StringBuilder().appendCodePoint(codePoint), true),
+                            mCurrentCursorStart, mCurrentCursorEnd);
+                    mCurrentCursorStart = mCurrentCursorEnd;
+                    Log.w("Fake", getDebugState());
+                    break;
             }
             handleEditEnd();
         }
@@ -1207,42 +1289,44 @@ public class FakeInputConnection implements InputConnection {
         CharSequence modifyCommittingText(CharSequence text);
     }
 
-    public static class NoTextModifier implements TextModifier {
-        public CharSequence modifyComposingText(CharSequence text) {
-            return text;
-        }
-
-        public CharSequence modifyCommittingText(CharSequence text) {
-            return text;
+    public static class DoubleTextModifier extends RepeatTextModifier {
+        public DoubleTextModifier() {
+            super(2);
         }
 
         @Override
         public String toString() {
-            return "NoTextModifier";
+            return "DoubleTextModifier";
         }
     }
 
-    public static class DoubleTextModifier implements TextModifier {
+    public static class RepeatTextModifier implements TextModifier {
+        final int count;
+        public RepeatTextModifier(int count) {
+            this.count = count;
+        }
+
         public CharSequence modifyComposingText(CharSequence text) {
-            return doubleText(text);
+            return repeatText(text);
         }
 
         public CharSequence modifyCommittingText(CharSequence text) {
-            return doubleText(text);
+            return repeatText(text);
         }
 
-        public static CharSequence doubleText(CharSequence text) {
+        public CharSequence repeatText(CharSequence text) {
             StringBuilder sb = new StringBuilder();
             for (int codePoint : text.codePoints().toArray()) {
-                sb.appendCodePoint(codePoint);
-                sb.appendCodePoint(codePoint);
+                for (int i = 0; i < count; i++) {
+                    sb.appendCodePoint(codePoint);
+                }
             }
             return sb.toString();
         }
 
         @Override
         public String toString() {
-            return "DoubleTextModifier";
+            return "RepeatTextModifier(" + count + ")";
         }
     }
 
@@ -1357,6 +1441,49 @@ public class FakeInputConnection implements InputConnection {
         }
     }
 
+    public static class AlterSpecificTextModifier implements TextModifier {
+        private final CharSequence original;
+        private final CharSequence update;
+        private final boolean onlyWholeText;
+        public AlterSpecificTextModifier(CharSequence original, CharSequence update, boolean onlyWholeText) {
+            this.original = original;
+            this.update = update;
+            this.onlyWholeText = onlyWholeText;
+        }
+        public CharSequence modifyComposingText(CharSequence text) {
+            return alterText(text);
+        }
+
+        public CharSequence modifyCommittingText(CharSequence text) {
+            return alterText(text);
+        }
+
+        public CharSequence alterText(CharSequence text) {
+            if (onlyWholeText) {
+                if (text != null && text.toString().equals(original.toString())) {
+                    return update;
+                }
+                return text;
+            }
+            SpannableStringBuilder sb = new SpannableStringBuilder();
+            for (int i = 0; i + original.length() <= text.length(); i++) {
+                if (text.subSequence(i, i + original.length()).toString().equals(original.toString())) {
+                    sb.append(update);
+                    i += original.length() - 1;
+                } else {
+                    sb.append(text.subSequence(i, i + 1));
+                }
+            }
+            return sb.toString();
+        }
+
+        @Override
+        public String toString() {
+            return "AlterSpecificTextModifier(\"" + original + "\", \"" + update + "\", "
+                    + onlyWholeText + ")";
+        }
+    }
+
     public static class ExtraTextTextModifier implements TextModifier {
         final CharSequence extraText;
         public ExtraTextTextModifier(final CharSequence extraText) {
@@ -1381,6 +1508,45 @@ public class FakeInputConnection implements InputConnection {
         @Override
         public String toString() {
             return "ExtraTextTextModifier(" + extraText + ")";
+        }
+    }
+
+    public static class BlockCharactersTextModifier implements TextModifier {
+        final char[] charsToBlock;
+        public BlockCharactersTextModifier(final char[] charsToBlock) {
+            this.charsToBlock = charsToBlock;
+        }
+
+        public CharSequence modifyComposingText(CharSequence text) {
+            return blockCharacters(text);
+        }
+
+        public CharSequence modifyCommittingText(CharSequence text) {
+            return blockCharacters(text);
+        }
+
+        public CharSequence blockCharacters(CharSequence text) {
+            StringBuilder sb = new StringBuilder();
+            for (int i = 0; i < text.length(); i++) {
+                char curChar = text.charAt(i);
+                boolean blockChar = false;
+                for (char charToBlock : charsToBlock) {
+                    if (curChar == charToBlock) {
+                        blockChar = true;
+                        break;
+                    }
+                }
+                if (blockChar) {
+                    continue;
+                }
+                sb.append(curChar);
+            }
+            return sb.toString();
+        }
+
+        @Override
+        public String toString() {
+            return "BlockCharactersTextModifier(" + Arrays.toString(charsToBlock) + ")";
         }
     }
 }
