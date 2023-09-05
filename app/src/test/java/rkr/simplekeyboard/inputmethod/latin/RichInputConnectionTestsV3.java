@@ -2933,7 +2933,7 @@ public class RichInputConnectionTestsV3 {
 //        }
     }
 
-    public static class DelayedUpdatesTestCase {
+    private static class DelayedUpdatesTestCase {
         private final String mTestName;
         private final VariableBehaviorSettings mSettings;
         private final State mInitialState;
@@ -5258,7 +5258,7 @@ public class RichInputConnectionTestsV3 {
         }
     }
 
-    public static class GetTextAdjacentToCursorTestCase
+    private static class GetTextAdjacentToCursorTestCase
             extends GetTextTestCaseBase<GetTextAdjacentToCursorTestCase> {
         int requestedLength;
         int requestedFlags;
@@ -5274,7 +5274,7 @@ public class RichInputConnectionTestsV3 {
             return this;
         }
     }
-    public static class GetSelectedTextTestCase
+    private static class GetSelectedTextTestCase
             extends GetTextTestCaseBase<GetSelectedTextTestCase> {
         int requestedFlags;
         public GetSelectedTextTestCase(String testName) {
@@ -5285,13 +5285,13 @@ public class RichInputConnectionTestsV3 {
             return this;
         }
     }
-    public static class GetComposedTextTestCase
+    private static class GetComposedTextTestCase
             extends GetTextTestCaseBase<GetComposedTextTestCase> {
         public GetComposedTextTestCase(String testName) {
             super(testName);
         }
     }
-    public static class GetTextTestCaseBase<T extends GetTextTestCaseBase<?>> {
+    private static class GetTextTestCaseBase<T extends GetTextTestCaseBase<?>> {
         final String testName;
         State initialState;
         Range[] initialCachedRanges;
