@@ -150,9 +150,7 @@ public final class RichInputConnection {
     private int mLastInvalidStateBatchIndex = -1;
 
     //TODO: (EW) consider using a linked list as that may be more efficient
-    //TODO: (EW) finish transitioning to use V2
     private final ArrayList<SelectionPositionState> mStateHistory = new ArrayList<>();
-    private final ArrayList<SelectionPositionStateV2> mStateHistoryV2 = new ArrayList<>();
     private final ArrayList<Long> mLastUpdateDelays = new ArrayList<>();
     private static final int UPDATE_DELAYS_TRACK_COUNT = 20;
 
@@ -421,22 +419,21 @@ public final class RichInputConnection {
     // in the text/cursor position
     private void prepSendAction() {
         if (mNestLevel <= 0) {
-            InternalActionEndState lastAction = getLastInternalActionState();
-            InternalActionEndState currentAction = new InternalActionEndState(mState,
-                    mRequestedExtractedTextMonitor);
+            testLog(TAG, "prepSendAction: " + mState.getDebugStateInternal());
             // if there were no previous updates or actions, whatever this action is will probably
             // change the selection or composition
             boolean expectSelectionUpdate = true;
-            SelectionPositionStateV2 lastAction2 = getLastInternalActionState2();
-            for (int i = mStateHistoryV2.size() - 1; i >= 0; i--) {
-                SelectionPositionStateV2 state = mStateHistoryV2.get(i);
+            SelectionPositionState lastAction = getLastInternalActionState();
+            for (int i = mStateHistory.size() - 1; i >= 0; i--) {
+                SelectionPositionState state = mStateHistory.get(i);
                 if (!state.isInternalAction() && !state.isSelectionUpdate()) {
                     continue;
                 }
+                testLog(TAG, "prepSendAction: state[" + i + "]: " + state);
                 if (state.selectionStart == mState.getSelectionStart()
                         && state.selectionEnd == mState.getSelectionEnd()) {
                     if (mState.isCompositionUnknown()
-                            || (mState.hasComposition() && mState.isAbsoluteSelectionStartKnown())
+                            || (mState.hasComposition() && !mState.isAbsoluteSelectionStartKnown())
                             || state.compositionStart == null || state.compositionEnd == null) {
                         // unsure about the composition either before or after the change, so it
                         // might not actually have a change in the composition, but we'll make the
@@ -447,24 +444,29 @@ public final class RichInputConnection {
                         // sure we got everything.
                         //TODO: (EW) consider flagging as unsure (maybe null) to try allowing a
                         // fallback expected update
+                        testLog(TAG, "prepSendAction: unsure if selection update is expected");
                         expectSelectionUpdate = true;
                     } else {
                         expectSelectionUpdate =
                                 state.compositionStart != mState.getCompositionStart()
                                         || state.compositionEnd != mState.getCompositionEnd();
+                        testLog(TAG, "prepSendAction: expectSelectionUpdate="
+                                + expectSelectionUpdate);
                     }
                 } else {
+                    testLog(TAG, "prepSendAction: selection position changed");
                     expectSelectionUpdate = true;
                 }
                 break;
             }
-            SelectionPositionStateV2 currentAction2 = SelectionPositionStateV2.internalAction(mState,
+            SelectionPositionState currentAction = SelectionPositionState.internalAction(mState,
                     expectSelectionUpdate,
                     mRequestedExtractedTextMonitor);
+            testLog(TAG, "prepSendAction: adding: " + currentAction);
             mStateHistory.add(currentAction);
-            mStateHistoryV2.add(currentAction2);
             if (lastAction != null) {
-                testLog(TAG, "last action was " + (currentAction.actionTime - lastAction.actionTime)
+                testLog(TAG, "last action was "
+                        + (currentAction.internalActionTime - lastAction.internalActionTime)
                         + " ms ago");
             }
         }
@@ -474,11 +476,9 @@ public final class RichInputConnection {
         testLog(TAG, "resetState(" + newSelStart + ", " + newSelEnd + ")");
         mState.reset();
         mStateHistory.clear();
-        mStateHistoryV2.clear();
         if (newSelStart >= 0 && newSelEnd >= 0) {
             mState.setSelection(newSelStart, newSelEnd);
-            mStateHistory.add(new ReloadedSelectionPositionState(newSelStart, newSelEnd));
-            mStateHistoryV2.add(SelectionPositionStateV2.reloadedSelection(newSelStart, newSelEnd));
+            mStateHistory.add(SelectionPositionState.reloadedSelection(newSelStart, newSelEnd));
         } else {
             mState.invalidateSelection(true, true);
             mState.invalidateComposition(false);
@@ -509,9 +509,7 @@ public final class RichInputConnection {
             Log.d(TAG, "Will try to retrieve text later.");
             return false;
         }
-        mStateHistory.add(new ReloadedSelectionPositionState(
-                mState.getSelectionStart(), mState.getSelectionEnd()));
-        mStateHistoryV2.add(SelectionPositionStateV2.reloadedSelection(
+        mStateHistory.add(SelectionPositionState.reloadedSelection(
                 mState.getSelectionStart(), mState.getSelectionEnd()));
         return true;
     }
@@ -2014,18 +2012,10 @@ public final class RichInputConnection {
         }
     }
 
-    private InternalActionEndState getLastInternalActionState() {
+    private SelectionPositionState getLastInternalActionState() {
         for (int i = mStateHistory.size() - 1; i >= 0; i--) {
-            if (mStateHistory.get(i) instanceof InternalActionEndState) {
-                return (InternalActionEndState) mStateHistory.get(i);
-            }
-        }
-        return null;
-    }
-    private SelectionPositionStateV2 getLastInternalActionState2() {
-        for (int i = mStateHistoryV2.size() - 1; i >= 0; i--) {
-            if (mStateHistoryV2.get(i).isInternalAction()) {
-                return mStateHistoryV2.get(i);
+            if (mStateHistory.get(i).isInternalAction()) {
+                return mStateHistory.get(i);
             }
         }
         return null;
@@ -2062,41 +2052,9 @@ public final class RichInputConnection {
         }
     }
 
-    private static class UpdateExpectationV2 {
-        private final boolean lookingForSelectionUpdates;
-        private final boolean lookingForExtractedTextUpdates;
-        private final SelectionPositionStateV2 lastSelectionUpdate;
-        private final SelectionPositionStateV2 lastExtractedTextUpdate;
-        private final SelectionPositionStateV2 lastUpdate;
-        private final SelectionPositionStateV2 nextExpectedSelectionUpdate;
-        private final SelectionPositionStateV2 nextExpectedExtractedTextUpdate;
-        private final int actionsWaitingForSelectionUpdates;
-        private final int actionsWaitingForExtractedTextUpdates;
-        public UpdateExpectationV2(boolean lookingForSelectionUpdates,
-                                 boolean lookingForExtractedTextUpdates,
-                                 SelectionPositionStateV2 lastSelectionUpdate,
-                                 SelectionPositionStateV2 lastExtractedTextUpdate,
-                                 SelectionPositionStateV2 lastUpdate,
-                                 SelectionPositionStateV2 nextExpectedSelectionUpdate,
-                                 SelectionPositionStateV2 nextExpectedExtractedTextUpdate,
-                                 int actionsWaitingForSelectionUpdates,
-                                 int actionsWaitingForExtractedTextUpdates) {
-            this.lookingForSelectionUpdates = lookingForSelectionUpdates;
-            this.lookingForExtractedTextUpdates = lookingForExtractedTextUpdates;
-            this.lastSelectionUpdate = lastSelectionUpdate;
-            this.lastExtractedTextUpdate = lastExtractedTextUpdate;
-            this.lastUpdate = lastUpdate;
-            this.nextExpectedSelectionUpdate = nextExpectedSelectionUpdate;
-            this.nextExpectedExtractedTextUpdate = nextExpectedExtractedTextUpdate;
-            this.actionsWaitingForSelectionUpdates = actionsWaitingForSelectionUpdates;
-            this.actionsWaitingForExtractedTextUpdates = actionsWaitingForExtractedTextUpdates;
-        }
-    }
-
     private UpdateExpectation getUpdateExpectation() {
         for (int i = mStateHistory.size() - 1; i >= 0; i--) {
-            SelectionPositionState state = mStateHistory.get(i);
-            testLog(TAG, "getUpdateExpectation: mStateHistory[" + i + "]=" + state);
+            testLog(TAG, "getUpdateExpectation: mStateHistory[" + i + "]=" + mStateHistory.get(i));
         }
         // track the smallest index that is needed and so everything earlier than it can be cleared
         // at the end
@@ -2115,6 +2073,9 @@ public final class RichInputConnection {
         int actionsWaitingForExtractedTextUpdates = 0;
         int lastUpdateSelectionCallIndex = -1;
         int lastUpdateExtractedTextCallIndex = -1;
+        int lastUpdateCallIndex = -1;
+        //TODO: (EW) we probably should track if there are any extracted text updates that we
+        // couldn't take the text update from to flag as needing a cache reload
         for (int i = mStateHistory.size() - 1; i >= 0; i--) {
             // since there may not be any extracted text notifications, we shouldn't count running
             // through the whole history to verify that so we can still clear old entries
@@ -2122,277 +2083,6 @@ public final class RichInputConnection {
                 minIndex = i;
             }
             SelectionPositionState state = mStateHistory.get(i);
-            if (state instanceof InternalActionEndState) {
-                InternalActionEndState internalActionEndState = (InternalActionEndState) state;
-                if (lastUpdateSelectionCallIndex == -1) {
-                    if (internalActionEndState.selectionUpdateTime > 0) {
-                        lastUpdateSelectionCallIndex = i;
-                    } else if (lastUpdateExtractedTextCallIndex == -1
-                            || lastUpdateExtractedTextCallIndex <= i) {
-                        // the next onUpdateSelection should be from either the same action that we
-                        // got the last onUpdateExtractedText from or from a more recent action
-                        // (either we already got the matching onUpdateSelection call or it isn't
-                        // going to come due to no change). we shouldn't expect an older update to
-                        // come in after receiving a more recent one.
-                        nextPotentialExpectedSelectionUpdateIndex = i;
-                        actionsWaitingForSelectionUpdates++;
-                    }
-                }
-                if (lastUpdateExtractedTextCallIndex == -1) {
-                    if (internalActionEndState.extractedTextUpdateTime > 0) {
-                        lastUpdateExtractedTextCallIndex = i;
-                        if (i < minIndex) {
-                            minIndex = i;
-                        }
-                    } else if (internalActionEndState.expectExtractedTextUpdate
-                            && (lastUpdateSelectionCallIndex == -1
-                                    || lastUpdateSelectionCallIndex <= i)) {
-                        // the next onUpdateExtractedText should be from either the same action that
-                        // we got the last onUpdateSelection from or from a more recent action
-                        // (either we already got the matching onUpdateExtractedText call or it
-                        // isn't going to come due to no change). we shouldn't expect an older
-                        // update to come in after receiving a more recent one.
-                        nextPotentialExpectedExtractedTextUpdateIndex = i;
-                        actionsWaitingForExtractedTextUpdates++;
-                    }
-                }
-            } else if (lastUpdateSelectionCallIndex == -1
-                    && state instanceof SelectionUpdateState) {
-                lastUpdateSelectionCallIndex = i;
-                //TODO: (EW) we potentially could use a SelectionUpdateState as the expectation for the next
-            } else if (lastUpdateExtractedTextCallIndex == -1
-                    && state instanceof ExtractedTextUpdateState) {
-                lastUpdateExtractedTextCallIndex = i;
-                if (i < minIndex) {
-                    minIndex = i;
-                }
-            }
-            if (lastUpdateSelectionCallIndex >= 0 && lastUpdateExtractedTextCallIndex >= 0) {
-                break;
-            }
-        }
-        SelectionPositionState lastSelectionUpdate = lastUpdateSelectionCallIndex >= 0
-                ? mStateHistory.get(lastUpdateSelectionCallIndex)
-                : null;
-        SelectionPositionState lastExtractedTextUpdate = lastUpdateExtractedTextCallIndex >= 0
-                ? mStateHistory.get(lastUpdateExtractedTextCallIndex)
-                : null;
-        SelectionPositionState lastUpdate =
-                lastUpdateSelectionCallIndex >= lastUpdateExtractedTextCallIndex
-                        ? lastSelectionUpdate
-                        : lastExtractedTextUpdate;
-
-        boolean lookingForSelectionUpdates = false;
-        SelectionPositionState nextExpectedSelectionUpdate = null;
-        if (nextPotentialExpectedSelectionUpdateIndex >= 0) {
-            // find the selection and compositions from the time of the start of the action
-            int actionStartSelectionStart = -1;
-            int actionStartSelectionEnd = -1;
-            Integer actionStartCompositionStart = null;
-            Integer actionStartCompositionEnd = null;
-            for (int i = nextPotentialExpectedSelectionUpdateIndex - 1; i >= 0; i--) {
-                if (i < minIndex) {
-                    minIndex = i;
-                }
-                SelectionPositionState state = mStateHistory.get(i);
-                if (state instanceof InternalActionEndState) {
-                    InternalActionEndState actionState = (InternalActionEndState) state;
-                    actionStartSelectionStart = actionState.selectionStart;
-                    actionStartSelectionEnd = actionState.selectionEnd;
-                    actionStartCompositionStart = actionState.compositionStart;
-                    actionStartCompositionEnd = actionState.compositionEnd;
-                    break;
-                } else if (state instanceof SelectionUpdateState) {
-                    SelectionUpdateState selectionUpdateState = (SelectionUpdateState) state;
-                    if (selectionUpdateState.appearsUpToDate != null
-                            && (boolean) selectionUpdateState.appearsUpToDate) {
-                        actionStartSelectionStart = selectionUpdateState.selectionStart;
-                        actionStartSelectionEnd = selectionUpdateState.selectionEnd;
-                        actionStartCompositionStart = selectionUpdateState.compositionStart;
-                        actionStartCompositionEnd = selectionUpdateState.compositionEnd;
-                        break;
-                    }
-                } else if (state instanceof ReloadedSelectionPositionState
-                        || state instanceof ExtractedTextUpdateState) {
-                    //TODO: (EW) we probably should use these, but we don't track composition
-                    // position with these entries
-                    actionStartSelectionStart = state.selectionStart;
-                    actionStartSelectionEnd = state.selectionEnd;
-                }
-            }
-
-            // find the next update we expect, ignoring actions that don't actually change the
-            // selection or composition positions since updates won't be sent for those
-            int nextExpectedUpdateIndex = -1;
-            for (int i = nextPotentialExpectedSelectionUpdateIndex; i >= 0 && i < mStateHistory.size(); i++) {
-                if (i < minIndex) {
-                    minIndex = i;
-                }
-                SelectionPositionState state = mStateHistory.get(i);
-                if (!(state instanceof InternalActionEndState)) {
-                    continue;
-                }
-                //TODO: (EW) consider returning an array of potential next updates. this could allow
-                // handling updates that have no net change that might be possible to receive
-                // updates for even if we normally wouldn't expect it, and it would support
-                // returning multiple options where some positions are unknown and we can't
-                // definitively say if there was a net change to be certain which update should be
-                // actually expected.
-                InternalActionEndState internalActionState = (InternalActionEndState) state;
-                if (actionStartSelectionStart != UNKNOWN_POSITION
-                        && actionStartSelectionStart == internalActionState.selectionStart
-                        && actionStartSelectionEnd != UNKNOWN_POSITION
-                        && actionStartSelectionEnd == internalActionState.selectionEnd
-                        && actionStartCompositionStart != null
-                        && internalActionState.compositionStart != null
-                        && (int) actionStartCompositionStart == internalActionState.compositionStart
-                        && actionStartCompositionEnd != null
-                        && internalActionState.compositionEnd != null
-                        && (int) actionStartCompositionEnd == internalActionState.compositionEnd) {
-                    // this action didn't have a change in the selection or composition positions,
-                    // so we wouldn't expect this update
-                    //TODO: (EW) we're not validating all of the actions, so this could be wrong. it
-                    // might actually be a better idea to have a flag on InternalActionEndState that
-                    // gets set when it is created to indicate if we expect a selection update for
-                    // it so we don't have to recalculate it here and simplify this calculation
-                    actionsWaitingForSelectionUpdates--;
-                    testLog(TAG, "getNextExpectedSelectionUpdate: ignoring action with no change: " + i);
-                    continue;
-                }
-                nextExpectedUpdateIndex = i;
-                break;
-            }
-
-            // if we found an update index, that means we requested an action with a known change
-            // (or assumed for unknown positions) after the last onUpdateSelection, so we're still
-            // waiting for that.
-            if (nextExpectedUpdateIndex >= 0) {
-                lookingForSelectionUpdates = true;
-                nextExpectedSelectionUpdate = mStateHistory.get(nextExpectedUpdateIndex);
-            }
-        }
-        // if we didn't find a specific next action we're waiting for, see if we're waiting for
-        // something based off of the last selection update. if the last update wasn't expected and
-        // we haven't fully taken the state from it (due to the chance that it was out-of-date) we
-        // should treat it as expecting an update (even if we don't know what specific update we're
-        // looking for and the lack of certainty that there actually will be another update).
-        if (!lookingForSelectionUpdates && lastSelectionUpdate instanceof SelectionUpdateState
-                && !((SelectionUpdateState)lastSelectionUpdate).updateFullyTaken) {
-            // if this update was determined to be out-of-date, we would at least have the selection
-            // positions at that time, which is a reasonable expectation of what to expect at some
-            // later point (not necessarily next, and possibly never if there was a batch going on
-            // at the time), although there is still no specific expectation of the composition
-            // position. even if we couldn't confirm that the update was out-of-date, there still
-            // is a chance that it was. also, if we got an more recent call to
-            // onUpdateExtractedText, that would be a likely case for the next selection update.
-            lookingForSelectionUpdates = true;
-            nextExpectedSelectionUpdate = null;
-            for (int i = lastUpdateSelectionCallIndex + 1; i < mStateHistory.size(); i++) {
-                if (i < minIndex) {
-                    minIndex = i;
-                }
-                SelectionPositionState state = mStateHistory.get(i);
-                if (state instanceof ReloadedSelectionPositionState
-                        || state instanceof ExtractedTextUpdateState) {
-                    nextExpectedSelectionUpdate = state;
-                    break;
-                }
-            }
-        }
-
-        boolean lookingForExtractedTextUpdates = false;
-        SelectionPositionState nextExpectedExtractedTextUpdate = null;
-        if (nextPotentialExpectedExtractedTextUpdateIndex >= 0) {
-            // currently we don't track if there were text changes, so we'll just assume that
-            // any action did change text
-            //TODO: (EW) this is blatantly wrong. cursor moves won't change text. we should
-            // either track text changes in actions or we should support returning a list of
-            // potential updates. given the lack of composition positions in the update for
-            // this, that may not be the best option. maybe just a list of 2 options would be
-            // enough for this since the next expected will keep moving to keep in line with
-            // selection updates (not expecting actions from older updates).
-            lookingForExtractedTextUpdates = true;
-            nextExpectedExtractedTextUpdate =
-                    mStateHistory.get(nextPotentialExpectedExtractedTextUpdateIndex);
-        }
-        // if we didn't find a specific next action we're waiting for, see if we're waiting for
-        // something based off of the last extracted text update. if the last update wasn't expected
-        // and it didn't seem up-to-date so we didn't take the update, we should treat it as
-        // expecting an update since we'll at least want to reload the text that we didn't take once
-        // it's safe.
-        if (!lookingForExtractedTextUpdates && lastExtractedTextUpdate instanceof ExtractedTextUpdateState
-                && (((ExtractedTextUpdateState)lastExtractedTextUpdate).appearsUpToDate == null
-                        || ((ExtractedTextUpdateState)lastExtractedTextUpdate).appearsUpToDate)) {
-            // if that update was determined to be out-of-date, we would at least have the selection
-            // positions at that time, which is a reasonable expectation of what to expect at some
-            // later point (not necessarily next, and possibly never if there was a batch going on
-            // at the time), although there is still no specific expectation of the composition
-            // position. even if we couldn't confirm that the update was out-of-date, there still is
-            // a chance that it was. also, if we got an more recent call to onUpdateSelection, that
-            // would be a likely case for the next extracted text update.
-            lookingForExtractedTextUpdates = true;
-            nextExpectedExtractedTextUpdate = null;
-            for (int i = lastUpdateSelectionCallIndex + 1; i < mStateHistory.size(); i++) {
-                if (i < minIndex) {
-                    minIndex = i;
-                }
-                SelectionPositionState state = mStateHistory.get(i);
-                if (state instanceof ReloadedSelectionPositionState
-                        || state instanceof SelectionUpdateState) {
-                    nextExpectedExtractedTextUpdate = state;
-                    break;
-                }
-            }
-        }
-
-        UpdateExpectation updateExpectation = new UpdateExpectation(
-                lookingForSelectionUpdates, lookingForExtractedTextUpdates,
-                lastSelectionUpdate, lastExtractedTextUpdate, lastUpdate,
-                nextExpectedSelectionUpdate, nextExpectedExtractedTextUpdate,
-                actionsWaitingForSelectionUpdates, actionsWaitingForExtractedTextUpdates);
-
-        // clear entries in the history that aren't relevant anymore
-        //TODO: (EW) do this more efficiently
-        while (minIndex > 0) {
-            mStateHistory.remove(minIndex - 1);
-            minIndex--;
-        }
-        testLog(TAG, "getUpdateExpectation: trimmed history to " + mStateHistory.size());
-
-        return updateExpectation;
-    }
-
-    private UpdateExpectationV2 getUpdateExpectationV2() {
-        for (int i = mStateHistoryV2.size() - 1; i >= 0; i--) {
-            testLog(TAG, "getUpdateExpectation: mStateHistory[" + i + "]=" + mStateHistoryV2.get(i));
-        }
-        // track the smallest index that is needed and so everything earlier than it can be cleared
-        // at the end
-        int minIndex = mStateHistoryV2.size() - 1;
-
-        // we only should look at internal actions after the last onUpdateSelection or
-        // onUpdateExtractedText call in the history for specific values of a update to expect.
-        // expected update calls will update the InternalActionEndState, so everything after is
-        // simply what we didn't get updates for yet, and unexpected update calls add an entry at
-        // the end, and an unexpected change (either external action or modified action) will likely
-        // impact any subsequent actions that we already sent and are waiting for updates for, so we
-        // shouldn't expect those exact updates that we originally requested.
-        int nextPotentialExpectedSelectionUpdateIndex = -1;
-        int nextPotentialExpectedExtractedTextUpdateIndex = -1;
-        int actionsWaitingForSelectionUpdates = 0;
-        int actionsWaitingForExtractedTextUpdates = 0;
-        int lastUpdateSelectionCallIndex = -1;
-        int lastUpdateExtractedTextCallIndex = -1;
-        int lastUpdateCallIndex = -1;
-        //TODO: (EW) we probably should track if there are any extracted text updates that we
-        // couldn't take the text update from to flag as needing a cache reload
-        for (int i = mStateHistoryV2.size() - 1; i >= 0; i--) {
-            // since there may not be any extracted text notifications, we shouldn't count running
-            // through the whole history to verify that so we can still clear old entries
-            if (lastUpdateSelectionCallIndex == -1 && i < minIndex) {
-                minIndex = i;
-            }
-            SelectionPositionStateV2 state = mStateHistoryV2.get(i);
             //TODO: (EW) update to handle the new pairing better
             if (state.isSelectionUpdate() && lastUpdateSelectionCallIndex == -1) {
                 lastUpdateSelectionCallIndex = i;
@@ -2431,18 +2121,18 @@ public final class RichInputConnection {
                 break;
             }
         }
-        SelectionPositionStateV2 lastSelectionUpdate = lastUpdateSelectionCallIndex >= 0
-                ? mStateHistoryV2.get(lastUpdateSelectionCallIndex)
+        SelectionPositionState lastSelectionUpdate = lastUpdateSelectionCallIndex >= 0
+                ? mStateHistory.get(lastUpdateSelectionCallIndex)
                 : null;
-        SelectionPositionStateV2 lastExtractedTextUpdate = lastUpdateExtractedTextCallIndex >= 0
-                ? mStateHistoryV2.get(lastUpdateExtractedTextCallIndex)
+        SelectionPositionState lastExtractedTextUpdate = lastUpdateExtractedTextCallIndex >= 0
+                ? mStateHistory.get(lastUpdateExtractedTextCallIndex)
                 : null;
-        SelectionPositionStateV2 lastUpdate = lastUpdateCallIndex >= 0
-                ? mStateHistoryV2.get(lastUpdateCallIndex)
+        SelectionPositionState lastUpdate = lastUpdateCallIndex >= 0
+                ? mStateHistory.get(lastUpdateCallIndex)
                 : null;
 
         boolean lookingForSelectionUpdates = false;
-        SelectionPositionStateV2 nextExpectedSelectionUpdate = null;
+        SelectionPositionState nextExpectedSelectionUpdate = null;
         if (nextPotentialExpectedSelectionUpdateIndex >= 0) {
             lookingForSelectionUpdates = true;
             //TODO: (EW) consider returning an array of potential next updates. this could allow
@@ -2451,7 +2141,7 @@ public final class RichInputConnection {
             // options where some positions are unknown and we can't definitively say if there was a
             // net change to be certain which update should be actually expected.
             nextExpectedSelectionUpdate =
-                    mStateHistoryV2.get(nextPotentialExpectedSelectionUpdateIndex);
+                    mStateHistory.get(nextPotentialExpectedSelectionUpdateIndex);
         }
         // if we didn't find a specific next action we're waiting for, see if we're waiting for
         // something based off of the last selection update. if the last update wasn't expected and
@@ -2470,12 +2160,12 @@ public final class RichInputConnection {
             // onUpdateExtractedText, that would be a likely case for the next selection update.
             lookingForSelectionUpdates = true;
             nextExpectedSelectionUpdate = null;
-            for (int i = lastUpdateSelectionCallIndex + 1; i < mStateHistoryV2.size(); i++) {
+            for (int i = lastUpdateSelectionCallIndex + 1; i < mStateHistory.size(); i++) {
                 if (i < minIndex) {
                     //TODO: (EW) can this block ever get hit?
                     minIndex = i;
                 }
-                SelectionPositionStateV2 state = mStateHistoryV2.get(i);
+                SelectionPositionState state = mStateHistory.get(i);
                 //TODO: (EW) I think this statement is always true
                 if (!state.isInternalAction() && !state.isSelectionUpdate()) {
                     nextExpectedSelectionUpdate = state;
@@ -2485,11 +2175,11 @@ public final class RichInputConnection {
         }
 
         boolean lookingForExtractedTextUpdates = false;
-        SelectionPositionStateV2 nextExpectedExtractedTextUpdate = null;
+        SelectionPositionState nextExpectedExtractedTextUpdate = null;
         if (nextPotentialExpectedExtractedTextUpdateIndex >= 0) {
             lookingForExtractedTextUpdates = true;
             nextExpectedExtractedTextUpdate =
-                    mStateHistoryV2.get(nextPotentialExpectedExtractedTextUpdateIndex);
+                    mStateHistory.get(nextPotentialExpectedExtractedTextUpdateIndex);
         }
         // if we didn't find a specific next action we're waiting for, see if we're waiting for
         // something based off of the last extracted text update. if the last update wasn't expected
@@ -2508,12 +2198,12 @@ public final class RichInputConnection {
             // would be a likely case for the next extracted text update.
             lookingForExtractedTextUpdates = true;
             nextExpectedExtractedTextUpdate = null;
-            for (int i = lastUpdateExtractedTextCallIndex + 1; i < mStateHistoryV2.size(); i++) {
+            for (int i = lastUpdateExtractedTextCallIndex + 1; i < mStateHistory.size(); i++) {
                 if (i < minIndex) {
                     //TODO: (EW) can this block ever get hit?
                     minIndex = i;
                 }
-                SelectionPositionStateV2 state = mStateHistoryV2.get(i);
+                SelectionPositionState state = mStateHistory.get(i);
                 //TODO: (EW) I think this statement is always true
                 if (!state.isInternalAction() && !state.isExtractedTextUpdate()) {
                     nextExpectedExtractedTextUpdate = state;
@@ -2522,7 +2212,7 @@ public final class RichInputConnection {
             }
         }
 
-        UpdateExpectationV2 updateExpectation = new UpdateExpectationV2(
+        UpdateExpectation updateExpectation = new UpdateExpectation(
                 lookingForSelectionUpdates, lookingForExtractedTextUpdates,
                 lastSelectionUpdate, lastExtractedTextUpdate, lastUpdate,
                 nextExpectedSelectionUpdate, nextExpectedExtractedTextUpdate,
@@ -2531,10 +2221,10 @@ public final class RichInputConnection {
         // clear entries in the history that aren't relevant anymore
         //TODO: (EW) do this more efficiently
         while (minIndex > 0) {
-            mStateHistoryV2.remove(minIndex - 1);
+            mStateHistory.remove(minIndex - 1);
             minIndex--;
         }
-        testLog(TAG, "getUpdateExpectation: trimmed history to " + mStateHistoryV2.size());
+        testLog(TAG, "getUpdateExpectation: trimmed history to " + mStateHistory.size());
 
         return updateExpectation;
     }
@@ -2599,7 +2289,7 @@ public final class RichInputConnection {
         boolean takeCompositionUpdate;
         Boolean appearsUpToDate;
         boolean statePositionsChanged = false;
-        ReloadedSelectionPositionState selectionReloadState = null;
+        SelectionPositionState selectionReloadState = null;
         if (positionsMatch(updateExpectation.lastSelectionUpdate,
                 newSelStart, newSelEnd, composingSpanStart, composingSpanEnd)) {
             testLog(TAG, "onUpdateSelection: no change selection update: " + mState.getDebugState());
@@ -2617,6 +2307,15 @@ public final class RichInputConnection {
             // it isn't really any different from not even getting the update yet. we don't normally
             // verify the state before doing actions, so those cases would have the same sort of
             // effect of working off of old data.
+            // note that it's possible that this case gets hit if we incorrectly flagged an update
+            // as up-to-date (such as if the cursor position returns to an old position just before
+            // the update for that first occurrence is sent), but since that case is less likely,
+            // it's probably best to avoid the extra delay from the IPC call, since this case will
+            // still eventually resolve itself once all the updates are in.
+            //TODO: (EW) there still may be some cases where actions could get into a messed up
+            // state if this^ incorrect case happened that might not get resolved correctly. try to
+            // add tests to point that flag the issue or give a reasonable level of confidence that
+            // this potential issue may not be real.
             wasExpected = false;
             takeSelectionUpdate = true;
             takeCompositionUpdate = true;
@@ -2645,19 +2344,18 @@ public final class RichInputConnection {
             //TODO: (EW) maybe determine - currently doesn't matter
             appearsUpToDate = null;
 
-            InternalActionEndState expectedUpdate =
-                    (InternalActionEndState) updateExpectation.nextExpectedSelectionUpdate;
+            SelectionPositionState expectedUpdate = updateExpectation.nextExpectedSelectionUpdate;
 
-            expectedUpdate.selectionUpdateTime = SystemClock.uptimeMillis();
+            expectedUpdate.pairSelectionUpdate(appearsUpToDate);//TODO: (EW) appearsUpToDate is always null
             mLastUpdateDelays.add(
-                    expectedUpdate.selectionUpdateTime - expectedUpdate.actionTime);
+                    expectedUpdate.selectionUpdateTime - expectedUpdate.internalActionTime);
             while (mLastUpdateDelays.size() > UPDATE_DELAYS_TRACK_COUNT) {
                 mLastUpdateDelays.remove(0);
             }
             // even if this update is out-of-date, it matches the next update we were
             // expecting, so we don't need to do anything from this update
             testLog(TAG, "onUpdateSelection: update matched next expected update and took "
-                    + (expectedUpdate.selectionUpdateTime - expectedUpdate.actionTime)
+                    + (expectedUpdate.selectionUpdateTime - expectedUpdate.internalActionTime)
                     + " ms");
             //TODO: (EW) probably call in all cases (at least above case)
             if (!mRequestedExtractedTextMonitor && newSelStart == newSelEnd) {
@@ -2667,8 +2365,8 @@ public final class RichInputConnection {
             }
         } else {
             testLog(TAG, "onUpdateSelection: update didn't match what was expected: " + updateExpectation.nextExpectedSelectionUpdate);
-            // note that expected state may have unknowns, so not matching doesn't necessarily mean
-            // this is from an external action or modification of the action we requested.
+            // note that the expected state may have unknowns, so not matching doesn't necessarily
+            // mean this is from an external action or modification of the action we requested.
             //TODO: (EW) should we have a carve-out if the next expected update has unknown cursor
             // positions?
             // it might be better to fall back to an unknown state to be safe
@@ -2687,7 +2385,7 @@ public final class RichInputConnection {
                 if ((updateFlags & SELECTION_UPDATED) > 0) {
                     testLog(TAG, "onUpdateSelection: SELECTION_UPDATED");
                     statePositionsChanged = true;
-                    selectionReloadState = new ReloadedSelectionPositionState(
+                    selectionReloadState = SelectionPositionState.reloadedSelection(
                             mState.getSelectionStart(), mState.getSelectionEnd());
                 }
                 if (appearsUpToDate) {
@@ -2779,11 +2477,31 @@ public final class RichInputConnection {
 
         if (!wasExpected) {
             boolean expectedSelectionMatches = mState.selectionMatches(newSelStart, newSelEnd, false);
-            SelectionUpdateState workingSelectionUpdateState = new SelectionUpdateState(
-                    newSelStart, newSelEnd, composingSpanStart, composingSpanEnd, appearsUpToDate,
-                    expectedSelectionMatches, takeSelectionUpdate);
-            testLog(TAG, "onUpdateSelection: add mStateHistory entry: " + workingSelectionUpdateState);
-            mStateHistory.add(workingSelectionUpdateState);
+            boolean expectedSelectionAlreadyMatched = expectedSelectionMatches && !statePositionsChanged;
+            boolean selectionUpdateFullyTaken = takeSelectionUpdate && takeCompositionUpdate;
+            boolean expectExtractedTextUpdate = mRequestedExtractedTextMonitor;
+            testLog(TAG, "onUpdateSelection: lastExtractedTextUpdate: "
+                    + updateExpectation.lastExtractedTextUpdate);
+            if (updateExpectation.lastExtractedTextUpdate != null
+                    && updateExpectation.lastExtractedTextUpdate.expectSelectionUpdate
+                    && !updateExpectation.lastExtractedTextUpdate.isSelectionUpdate()
+                    && updateExpectation.lastExtractedTextUpdate.selectionStart == newSelStart
+                    && updateExpectation.lastExtractedTextUpdate.selectionEnd == newSelEnd) {
+                //TODO: (EW) since the extracted text update doesn't have the composition positions,
+                // we're just assuming this is the correct pair based only on the selection
+                // positions. verify if there are issues this may cause.
+                updateExpectation.lastExtractedTextUpdate.pairSelectionUpdate(appearsUpToDate);
+                updateExpectation.lastExtractedTextUpdate.compositionStart = composingSpanStart;
+                updateExpectation.lastExtractedTextUpdate.compositionEnd = composingSpanEnd;
+            } else {
+                SelectionPositionState workingSelectionUpdateState =
+                        SelectionPositionState.selectionUpdate(newSelStart, newSelEnd,
+                                composingSpanStart, composingSpanEnd, appearsUpToDate,
+                                expectedSelectionAlreadyMatched, takeSelectionUpdate,
+                                selectionUpdateFullyTaken, expectExtractedTextUpdate);
+                testLog(TAG, "onUpdateSelection: add mStateHistory entry: " + workingSelectionUpdateState);
+                mStateHistory.add(workingSelectionUpdateState);
+            }
             // if we updated the selection from a call to check the position and that indicated that the
             // update was out-of-date, keep track of where we updated the selection from. if we have an
             // up-to-date update, we can see that we update from that
@@ -2857,30 +2575,14 @@ public final class RichInputConnection {
     private boolean positionsMatch(SelectionPositionState expectedUpdate,
                                    final int newSelStart, final int newSelEnd,
                                    final int composingSpanStart, final int composingSpanEnd) {
-        if (expectedUpdate instanceof InternalActionEndState) {
-            InternalActionEndState internalActionEndState = (InternalActionEndState) expectedUpdate;
-            // check if the update matches the expected update. note that expected state may
-            // have unknowns, so not matching doesn't necessarily mean this is from an external
-            // action or modification of the action we requested.
-            if (internalActionEndState.selectionStart == newSelStart
-                    && internalActionEndState.selectionEnd == newSelEnd
-                    && internalActionEndState.compositionStart != null
-                    && internalActionEndState.compositionStart == composingSpanStart
-                    && internalActionEndState.compositionEnd != null
-                    && internalActionEndState.compositionEnd == composingSpanEnd) {
-                return true;
-            }
-        } else if (expectedUpdate instanceof SelectionUpdateState) {
-            SelectionUpdateState selectionUpdateState = (SelectionUpdateState) expectedUpdate;
-            if (selectionUpdateState.selectionStart == newSelStart
-                    && selectionUpdateState.selectionEnd == newSelEnd
-                    && selectionUpdateState.compositionStart == composingSpanStart
-                    && selectionUpdateState.compositionEnd == composingSpanEnd) {
-                return true;
-            }
-        }
-        //TODO: (EW) would it be useful to do anything with matches for everything that is unknown?
-        return false;
+        // some states may not contain the composition, so we can't verify that they match
+        //TODO: (EW) would it be useful to do anything with matches for everything that is known?
+        return expectedUpdate != null && expectedUpdate.selectionStart == newSelStart
+                && expectedUpdate.selectionEnd == newSelEnd
+                && expectedUpdate.compositionStart != null
+                && expectedUpdate.compositionStart == composingSpanStart
+                && expectedUpdate.compositionEnd != null
+                && expectedUpdate.compositionEnd == composingSpanEnd;
     }
 
     private boolean positionsMatch(SelectionPositionState expectedUpdate,
@@ -2944,141 +2646,9 @@ public final class RichInputConnection {
         }
 
         //TODO: (EW) clean up the duplicate code that is after loading the cursor position
-        if (updateExpectation.lastSelectionUpdate instanceof SelectionUpdateState) {
-            SelectionUpdateState selectionUpdateState =
-                    (SelectionUpdateState)updateExpectation.lastSelectionUpdate;
-            if (!selectionUpdateState.updateFullyTaken
-                    && selectionUpdateState.appearsUpToDate != null
-                    && selectionUpdateState.appearsUpToDate
-                    && mState.selectionMatches(selectionUpdateState.selectionStart,
-                            selectionUpdateState.selectionEnd, false)) {
-                // the last update looked up-to-date originally, and there hasn't been an update
-                // since, and the selection position still matches, so since this gets triggered by
-                // the timer, if there were more updates in-flight, when we received this, we should
-                // have already received at least some of them by now, but since that didn't happen,
-                // that update should be up-to-date, so we should take the composition without
-                // needing to verify the current position.
-                boolean statePositionsChanged = false;
-                if (selectionUpdateState.compositionStart == UNKNOWN_POSITION
-                        || selectionUpdateState.compositionEnd == UNKNOWN_POSITION) {
-                    if (selectionUpdateState.compositionStart != mState.getCompositionStart()
-                            || selectionUpdateState.compositionEnd != mState.getCompositionEnd()) {
-                        mState.finishComposingText();
-                        statePositionsChanged = true;
-                    }
-                } else {
-                    if (selectionUpdateState.compositionStart != mState.getCompositionStart()
-                            || selectionUpdateState.compositionEnd != mState.getCompositionEnd()) {
-                        mState.setComposingRegion(selectionUpdateState.compositionStart,
-                                selectionUpdateState.compositionEnd);
-                        statePositionsChanged = true;
-                    }
-                }
-                selectionUpdateState.updateFullyTaken = true;
-                return statePositionsChanged;
-            }
-        }
-
-        boolean statePositionsChanged = false;
-        boolean triedReloadingCache = false;
-
-        // see if we need to take updates from the last selection update
-        if (updateExpectation.nextExpectedSelectionUpdate instanceof InternalActionEndState) {
-            testLog(TAG, "checkLostUpdates: waiting on blocked action");
-            // it looks like action we're waiting for was blocked since we never got an update, so
-            // we should revert back to the last update. since we're not tracking the specific
-            // edits, this means we'll need to clear and reload the text cache. to safeguard against
-            // an editor misbehaving and simply not sending updates when the action did work, we'll
-            // try loading the selection before just blindly taking the last update.
-            mState.invalidateTextCache();
-            LoadAndValidateCacheResult result = loadAndValidateCache(true, true);
-            triedReloadingCache = true;
-            if (updateExpectation.lastSelectionUpdate != null) {
-                boolean takeUpdate = false;
-                if ((result.updateFlags & SELECTION_LOADED) > 0) {
-                    if (mState.selectionMatches(updateExpectation.lastSelectionUpdate.selectionStart,
-                            updateExpectation.lastSelectionUpdate.selectionEnd, false)) {
-                        // we successfully reloaded the current selection, which matches the last
-                        // selection update, so it should be relatively safe to update the
-                        // composition from it
-                        takeUpdate = true;
-                    }
-                } else {
-                    //TODO: (EW) how should we handle no validation of the selection?
-                    takeUpdate = true;
-                }
-                if (takeUpdate) {
-                    statePositionsChanged = updateCompositionFromUpdate(updateExpectation.lastSelectionUpdate);
-                    if (updateExpectation.lastSelectionUpdate instanceof SelectionUpdateState) {
-                        SelectionUpdateState selectionUpdateState = (SelectionUpdateState) updateExpectation.lastSelectionUpdate;
-                        selectionUpdateState.updateFullyTaken = true;
-                    }
-                }
-                //TODO: (EW) do something to flag this and any other internal actions we're waiting
-                // for as having been addressed
-            } else {
-                // since we haven't received an update previously, there isn't anything to fall back
-                // on, so we'll just need to rely on the selection reload and any composition will
-                // have to fall back to an unknown state.
-                mState.invalidateComposition(true);
-            }
-        } else if (updateExpectation.lastSelectionUpdate instanceof SelectionUpdateState) {
-            SelectionUpdateState selectionUpdateState = (SelectionUpdateState) updateExpectation.lastSelectionUpdate;
-            testLog(TAG, "checkLostUpdates: last selection update selection taken: " + selectionUpdateState.selectionTaken);
-            testLog(TAG, "checkLostUpdates: last selection update fully taken: " + selectionUpdateState.updateFullyTaken);
-            testLog(TAG, "checkLostUpdates: last selection update already matched selection: " + selectionUpdateState.expectedSelectionAlreadyMatched);
-            if (!selectionUpdateState.updateFullyTaken) {
-                if (selectionUpdateState.selectionTaken
-                        || selectionUpdateState.expectedSelectionAlreadyMatched) {
-                    if (mState.selectionMatches(selectionUpdateState.selectionStart,
-                            selectionUpdateState.selectionEnd, false)) {
-                        // the last update matches the current state (at least for the cursor position).
-                        // since this gets triggered by the timer, if there were more updates in-flight,
-                        // when we received this, we should have already received at least some of them
-                        // by now, but since that didn't happen, that update should be up-to-date, so we
-                        // should take the composition.
-                        statePositionsChanged = updateCompositionFromUpdate(selectionUpdateState);
-                        selectionUpdateState.updateFullyTaken = true;
-                    } else {
-                        // it seems that we're still waiting on another update
-                        //TODO: maybe trigger another timer. the editor may just have a bug, so
-                        // I don't know that we want a timer repeating forever if that's the
-                        // case. either add some counter for it or call it a lost cause and
-                        // assume we just won't get the update.
-                    }
-                } else {
-                    // we didn't take the update presumably because it seemed out of date or we
-                    // didn't know the absolute positions to know what action update to expect
-                    //TODO: (EW) is there anything worth doing here?
-                    testLog(TAG, "checkLostUpdates: last selection update selection taken: " + selectionUpdateState.selectionTaken);
-                }
-            }
-        }
-
-        //TODO: (EW) handle reloading text for extracted text updates that we weren't able to take
-
-        //TODO: (EW) should this clear part or all of the history so we ensure we don't try looking
-        // for a missing update a second time? we should at least do something to block the same
-        // update as being the next expected one
-        // once this only gets called on the timer, whatever manages starting/stopping it should
-        // address this
-
-        return statePositionsChanged;
-    }
-    public boolean checkLostUpdatesV2() {
-        testLog(TAG, "checkLostUpdates");
-        UpdateExpectationV2 updateExpectation = getUpdateExpectationV2();
-        testLog(TAG, "checkLostUpdates: lookingForSelectionUpdates="
-                + updateExpectation.lookingForSelectionUpdates);
-        if (!updateExpectation.lookingForSelectionUpdates) {
-            // as far as we're aware, we have received all necessary updates
-            return false;
-        }
-
-        //TODO: (EW) clean up the duplicate code that is after loading the cursor position
         if (updateExpectation.lastSelectionUpdate != null
                 && !updateExpectation.lastSelectionUpdate.isInternalAction()) {
-            SelectionPositionStateV2 selectionUpdateState = updateExpectation.lastSelectionUpdate;
+            SelectionPositionState selectionUpdateState = updateExpectation.lastSelectionUpdate;
             if (!selectionUpdateState.selectionUpdateFullyTaken
                     && selectionUpdateState.updateAppearsUpToDate()
                     && mState.selectionMatches(selectionUpdateState.selectionStart,
@@ -3140,10 +2710,13 @@ public final class RichInputConnection {
                     takeUpdate = true;
                 }
                 if (takeUpdate) {
+                    testLog(TAG, "checkLostUpdates: updating composition from update");
                     statePositionsChanged = updateCompositionFromUpdate(updateExpectation.lastSelectionUpdate);
                     if (updateExpectation.lastSelectionUpdate.isSelectionUpdate()) {
                         updateExpectation.lastSelectionUpdate.selectionUpdateFullyTaken = true;
                     }
+                } else {
+                    testLog(TAG, "checkLostUpdates: not taking updates");
                 }
                 //TODO: (EW) do something to flag this and any other internal actions we're waiting
                 // for as having been addressed
@@ -3151,11 +2724,12 @@ public final class RichInputConnection {
                 // since we haven't received an update previously, there isn't anything to fall back
                 // on, so we'll just need to rely on the selection reload and any composition will
                 // have to fall back to an unknown state.
+                testLog(TAG, "checkLostUpdates: invalidating composition due to no previous update");
                 mState.invalidateComposition(true);
             }
         } else if (updateExpectation.lastSelectionUpdate != null
                 && updateExpectation.lastSelectionUpdate.isSelectionUpdate()) {
-            SelectionPositionStateV2 selectionUpdateState = updateExpectation.lastSelectionUpdate;
+            SelectionPositionState selectionUpdateState = updateExpectation.lastSelectionUpdate;
             testLog(TAG, "checkLostUpdates: last selection update selection taken: " + selectionUpdateState.selectionTaken);
             testLog(TAG, "checkLostUpdates: last selection update fully taken: " + selectionUpdateState.selectionUpdateFullyTaken);
             testLog(TAG, "checkLostUpdates: last selection update already matched selection: " + selectionUpdateState.expectedSelectionAlreadyMatched);
@@ -3199,38 +2773,6 @@ public final class RichInputConnection {
     }
 
     private boolean updateCompositionFromUpdate(SelectionPositionState state) {
-        boolean statePositionsChanged = false;
-        int compositionStart;
-        int compositionEnd;
-        if (state instanceof SelectionUpdateState) {
-            SelectionUpdateState selectionUpdateState = (SelectionUpdateState) state;
-            compositionStart = selectionUpdateState.compositionStart;
-            compositionEnd = selectionUpdateState.compositionEnd;
-        } else if (state instanceof InternalActionEndState) {
-            InternalActionEndState internalActionEndState = (InternalActionEndState) state;
-            if (internalActionEndState.compositionStart == null || internalActionEndState.compositionEnd == null) {
-                return false;
-            }
-            compositionStart = internalActionEndState.compositionStart;
-            compositionEnd = internalActionEndState.compositionEnd;
-        } else {
-            return false;
-        }
-        if (compositionStart == UNKNOWN_POSITION || compositionEnd == UNKNOWN_POSITION) {
-            if (mState.isCompositionUnknown() || mState.hasComposition()) {
-                mState.finishComposingText();
-                statePositionsChanged = true;
-            }
-        } else {
-            if (compositionStart != mState.getCompositionStart()
-                    || compositionEnd != mState.getCompositionEnd()) {
-                mState.setComposingRegion(compositionStart, compositionEnd);
-                statePositionsChanged = true;
-            }
-        }
-        return statePositionsChanged;
-    }
-    private boolean updateCompositionFromUpdate(SelectionPositionStateV2 state) {
         if (state.compositionStart == null || state.compositionEnd == null) {
             return false;
         }
@@ -3296,7 +2838,7 @@ public final class RichInputConnection {
         boolean takeTextUpdate;
         Boolean appearsUpToDate;
         boolean statePositionsChanged = false;
-        ReloadedSelectionPositionState selectionReloadState = null;
+        SelectionPositionState selectionReloadState = null;
         if (!updateExpectation.lookingForExtractedTextUpdates) {
             //TODO: (EW) I think this should check that we're not waiting for selection updates. if
             // we are, that means something unexpected happened, so it could mess things up to take
@@ -3330,22 +2872,28 @@ public final class RichInputConnection {
             takeTextUpdate = updateExpectation.actionsWaitingForExtractedTextUpdates == 1
                     /*&& !mState.selectionMatches(updatedSelectionStart, updatedSelectionEnd, false)
                     && (!(updateExpectation.lastUpdate instanceof UpdatePositionState)
-                            || ((UpdatePositionState)updateExpectation.lastUpdate).selectionTaken)*/;
+                            || ((UpdatePositionState)updateExpectation.lastUpdate).selectionTaken)*/
+                    && mNestLevel <= 0;
+            if (!takeTextUpdate) {
+                testLog(TAG, "not taking text update because there are "
+                        + updateExpectation.actionsWaitingForExtractedTextUpdates
+                        + " actions waiting for extracted text updates");
+            }
             //TODO: (EW) maybe determine - currently doesn't matter
             appearsUpToDate = null;
 
-            if (updateExpectation.nextExpectedExtractedTextUpdate instanceof InternalActionEndState) {
-                InternalActionEndState expectedUpdate =
-                        (InternalActionEndState) updateExpectation.nextExpectedExtractedTextUpdate;
+            if (updateExpectation.nextExpectedExtractedTextUpdate.isInternalAction()) {
+                SelectionPositionState expectedUpdate =
+                        updateExpectation.nextExpectedExtractedTextUpdate;
 
-                expectedUpdate.extractedTextUpdateTime = SystemClock.uptimeMillis();
+                expectedUpdate.pairExtractedTextUpdate(appearsUpToDate);//TODO: (EW) appearsUpToDate is always null
                 mLastUpdateDelays.add(
-                        expectedUpdate.extractedTextUpdateTime - expectedUpdate.actionTime);
+                        expectedUpdate.extractedTextUpdateTime - expectedUpdate.internalActionTime);
                 while (mLastUpdateDelays.size() > UPDATE_DELAYS_TRACK_COUNT) {
                     mLastUpdateDelays.remove(0);
                 }
                 testLog(TAG, "onUpdateExtractedText: update matched next expected update and took "
-                        + (expectedUpdate.extractedTextUpdateTime - expectedUpdate.actionTime)
+                        + (expectedUpdate.extractedTextUpdateTime - expectedUpdate.internalActionTime)
                         + " ms");
             }
         } else {
@@ -3359,6 +2907,7 @@ public final class RichInputConnection {
             // update, we can't take an update to shift the text since it's not clear what needs to
             // shift to compensate for the action we expected.
             takeSelectionUpdate = false;
+            boolean cursorPositionOriginallyKnown = mState.isAbsoluteSelectionStartKnown();
             // verify this update is up-to-date. this will update the cache with current cursor
             // positions (if they could be loaded), and it may clear text from the cache depending
             // on how the selection positions change.
@@ -3371,15 +2920,25 @@ public final class RichInputConnection {
                     // if the selection changed, it should have wiped the text cache. sitting in a
                     // blank state isn't too bad. we can probably just get the text later when we
                     // need it.
-                    if ((updateFlags & SELECTION_UPDATED) > 0) {
+
+                    //TODO: (EW) verify that this carve-out for originally unknown positions is fine
+                    // and doesn't cause some weird inconsistency
+                    if (cursorPositionOriginallyKnown) {
+                        takeTextUpdate = true;
+                        statePositionsChanged = (updateFlags & SELECTION_UPDATED) > 0;
+                        selectionReloadState = SelectionPositionState.reloadedSelection(
+                                mState.getSelectionStart(), mState.getSelectionEnd());
+                    } else if ((updateFlags & SELECTION_UPDATED) > 0) {
+                        testLog(TAG, "not taking text update because the selection changed unexpectedly");
                         takeTextUpdate = false;
                         statePositionsChanged = true;
-                        selectionReloadState = new ReloadedSelectionPositionState(
+                        selectionReloadState = SelectionPositionState.reloadedSelection(
                                 mState.getSelectionStart(), mState.getSelectionEnd());
                     } else {
                         takeTextUpdate = true;
                     }
                 } else {
+                    testLog(TAG, "not taking text update because update is out-of-date");
                     //TODO: (EW) how should we flag the update to be taken later
                     takeTextUpdate = false;
                 }
@@ -3408,9 +2967,16 @@ public final class RichInputConnection {
             // incorrect (or maybe it should be renamed if it's just looking for if the end state
             // when receiving the update matches the update)
             boolean selectionTaken = mState.selectionMatches(updatedSelectionStart, updatedSelectionEnd, false);
-            ExtractedTextUpdateState workingExtractedTextUpdateState = new ExtractedTextUpdateState(
-                    updatedSelectionStart, updatedSelectionEnd, appearsUpToDate, selectionTaken);
-            testLog(TAG, "onUpdateExtractedText: add mStateHistory entry: " + workingExtractedTextUpdateState);
+            //TODO: (EW) this probably should check if there already was a selection update for
+            // this. actually, maybe due to it not getting flagged as expected (from the matching
+            // selection update) this is correct.
+            boolean expectSelectionUpdate = true;
+            SelectionPositionState workingExtractedTextUpdateState =
+                    SelectionPositionState.extractedTextUpdate(
+                            updatedSelectionStart, updatedSelectionEnd, appearsUpToDate,
+                            selectionTaken, expectSelectionUpdate);
+            testLog(TAG, "onUpdateExtractedText: add mStateHistory entry: "
+                    + workingExtractedTextUpdateState);
             mStateHistory.add(workingExtractedTextUpdateState);
             // if we updated the selection from a call to check the position and that indicated that the
             // update was out-of-date, keep track of where we updated the selection from. if we have an
@@ -3776,7 +3342,7 @@ public final class RichInputConnection {
     // 4. internal action
     //    unexpected extracted text, paired selection
     // 5. internal action, no paired selection (no change), maybe paired extracted text
-    private static class SelectionPositionStateV2 {
+    private static class SelectionPositionState {
         final int selectionStart;
         final int selectionEnd;
         Integer compositionStart;
@@ -3794,18 +3360,18 @@ public final class RichInputConnection {
         //TODO: (EW) maybe add a timestamp to use for clearing items from list (probably need since
         // we won't get some updates) (probably still always want to keep the most recent actual
         // update)
-        private SelectionPositionStateV2(final int selectionStart, final int selectionEnd,
-                                         final Integer compositionStart,
-                                         final Integer compositionEnd,
-                                         boolean isInternalAction,
-                                         boolean expectSelectionUpdate,
-                                         boolean isSelectionUpdate,
-                                         boolean selectionUpdateFullyTaken,
-                                         boolean expectExtractedTextUpdate,
-                                         boolean isExtractedTextUpdate,
-                                         boolean expectedSelectionAlreadyMatched,
-                                         boolean selectionTaken,
-                                         Boolean updateAppearsUpToDate) {
+        private SelectionPositionState(final int selectionStart, final int selectionEnd,
+                                       final Integer compositionStart,
+                                       final Integer compositionEnd,
+                                       boolean isInternalAction,
+                                       boolean expectSelectionUpdate,
+                                       boolean isSelectionUpdate,
+                                       boolean selectionUpdateFullyTaken,
+                                       boolean expectExtractedTextUpdate,
+                                       boolean isExtractedTextUpdate,
+                                       boolean expectedSelectionAlreadyMatched,
+                                       boolean selectionTaken,
+                                       Boolean updateAppearsUpToDate) {
             this.selectionStart = selectionStart;
             this.selectionEnd = selectionEnd;
             this.compositionStart = compositionStart;
@@ -3861,9 +3427,9 @@ public final class RichInputConnection {
             return updateAppearsUpToDate != null && !updateAppearsUpToDate;
         }
 
-        public static SelectionPositionStateV2 internalAction(EditorState state,
-                                                              boolean expectSelectionUpdate,
-                                                              boolean expectExtractedTextUpdate) {
+        public static SelectionPositionState internalAction(EditorState state,
+                                                            boolean expectSelectionUpdate,
+                                                            boolean expectExtractedTextUpdate) {
             Integer compositionStart;
             Integer compositionEnd;
             if (state.isCompositionUnknown()) {
@@ -3873,44 +3439,44 @@ public final class RichInputConnection {
                 compositionStart = state.getCompositionStart();
                 compositionEnd = state.getCompositionEnd();
             }
-            return new SelectionPositionStateV2(state.getSelectionStart(), state.getSelectionEnd(),
+            return new SelectionPositionState(state.getSelectionStart(), state.getSelectionEnd(),
                     compositionStart, compositionEnd, true,
                     expectSelectionUpdate, false, false,
                     expectExtractedTextUpdate, false,
                     false, false, null);
         }
 
-        public static SelectionPositionStateV2 selectionUpdate(final int selectionStart,
-                                                               final int selectionEnd,
-                                                               final int compositionStart,
-                                                               final int compositionEnd,
-                                                               final Boolean appearsUpToDate,
-                                                               final boolean expectedSelectionAlreadyMatched,
-                                                               final boolean selectionTaken,
-                                                               final boolean selectionUpdateFullyTaken,
-                                                               final boolean expectExtractedTextUpdate) {
-            return new SelectionPositionStateV2(selectionStart, selectionEnd,
+        public static SelectionPositionState selectionUpdate(final int selectionStart,
+                                                             final int selectionEnd,
+                                                             final int compositionStart,
+                                                             final int compositionEnd,
+                                                             final Boolean appearsUpToDate,
+                                                             final boolean expectedSelectionAlreadyMatched,
+                                                             final boolean selectionTaken,
+                                                             final boolean selectionUpdateFullyTaken,
+                                                             final boolean expectExtractedTextUpdate) {
+            return new SelectionPositionState(selectionStart, selectionEnd,
                     compositionStart, compositionEnd, false,
                     false, true, selectionUpdateFullyTaken,
                     expectExtractedTextUpdate, false,
                     expectedSelectionAlreadyMatched, selectionTaken, appearsUpToDate);
         }
 
-        public static SelectionPositionStateV2 extractedTextUpdate(final int selectionStart,
-                                                                   final int selectionEnd,
-                                                                   final Boolean appearsUpToDate,
-                                                                   final boolean selectionTaken,
-                                                                   boolean expectSelectionUpdate) {
-            return new SelectionPositionStateV2(selectionStart, selectionEnd,
+        public static SelectionPositionState extractedTextUpdate(final int selectionStart,
+                                                                 final int selectionEnd,
+                                                                 final Boolean appearsUpToDate,
+                                                                 final boolean selectionTaken,
+                                                                 boolean expectSelectionUpdate) {
+            return new SelectionPositionState(selectionStart, selectionEnd,
                     null, null, false,
                     expectSelectionUpdate, false, false,
                     false, true,
                     false, selectionTaken, appearsUpToDate);
         }
 
-        public static SelectionPositionStateV2 reloadedSelection(final int selectionStart,
-                                                                 final int selectionEnd) {
-            return new SelectionPositionStateV2(selectionStart, selectionEnd,
+        public static SelectionPositionState reloadedSelection(final int selectionStart,
+                                                               final int selectionEnd) {
+            return new SelectionPositionState(selectionStart, selectionEnd,
                     null, null, false,
                     false, false, false,
                     false, false,
@@ -3933,14 +3499,30 @@ public final class RichInputConnection {
                         && selectionUpdateTime >= extractedTextUpdateTime) {
                     sb.append("+SelectionUpdate");
                 }
+            } else if (selectionUpdateTime > 0 && (extractedTextUpdateTime == 0
+                    || selectionUpdateTime < extractedTextUpdateTime)) {
+                sb.append("SelectionUpdate");
+                if (extractedTextUpdateTime > 0) {
+                    sb.append("+ExtractedTextUpdate");
+                }
+            } else if (extractedTextUpdateTime > 0) {
+                sb.append("ExtractedTextUpdate");
+                if (selectionUpdateTime > 0) {
+                    sb.append("+SelectionUpdate");
+                }
+            } else {
+                sb.append("ReloadedSelectionPosition");
             }
             sb.append(": selStart=").append(selectionStart);
             sb.append(", selEnd=").append(selectionEnd);
             if (isInternalAction() || isSelectionUpdate()) {
-                sb.append(", compStart=").append(selectionEnd);
-                sb.append(", compEnd=").append(selectionEnd);
+                sb.append(", compStart=").append(compositionStart);
+                sb.append(", compEnd=").append(compositionEnd);
             }
-            if (!isSelectionUpdate()) {
+            if (isSelectionUpdate()) {
+                sb.append(", selectionUpdateFullyTaken=").append(selectionUpdateFullyTaken);
+                sb.append(", expectedSelectionAlreadyMatched=").append(expectedSelectionAlreadyMatched);
+            } else {
                 sb.append(", expectSelectionUpdate=").append(expectSelectionUpdate);
             }
             if (!isExtractedTextUpdate()) {
@@ -3948,118 +3530,9 @@ public final class RichInputConnection {
             }
             if (isSelectionUpdate() || isExtractedTextUpdate()) {
                 sb.append(", updateAppearsUpToDate=").append(updateAppearsUpToDate);
+                sb.append(", selectionTaken=").append(selectionTaken);
             }
             return sb.toString();
-        }
-    }
-
-    private static class SelectionPositionState {
-        protected final int selectionStart;
-        protected final int selectionEnd;
-        //TODO: (EW) maybe add a timestamp to use for clearing items from list (probably need since
-        // we won't get some updates) (probably still always want to keep the most recent actual
-        // update)
-        SelectionPositionState(final int selectionStart, final int selectionEnd) {
-            this.selectionStart = selectionStart;
-            this.selectionEnd = selectionEnd;
-        }
-    }
-    private static class InternalActionEndState extends SelectionPositionState {
-        final Integer compositionStart;
-        final Integer compositionEnd;
-        final long actionTime = SystemClock.uptimeMillis();
-        long selectionUpdateTime = 0;
-        long extractedTextUpdateTime = 0;
-        final boolean expectExtractedTextUpdate;
-        InternalActionEndState(final int selectionStart, final int selectionEnd,
-                               final Integer compositionStart, final Integer compositionEnd,
-                               boolean expectExtractedTextUpdate) {
-            super(selectionStart, selectionEnd);
-            this.compositionStart = compositionStart;
-            this.compositionEnd = compositionEnd;
-            this.expectExtractedTextUpdate = expectExtractedTextUpdate;
-        }
-        InternalActionEndState(EditorState state, boolean expectExtractedTextUpdate) {
-            super(state.getSelectionStart(), state.getSelectionEnd());
-            if (state.isCompositionUnknown()) {
-                this.compositionStart = null;
-                this.compositionEnd = null;
-            } else {
-                this.compositionStart = state.getCompositionStart();
-                this.compositionEnd = state.getCompositionEnd();
-            }
-            this.expectExtractedTextUpdate = expectExtractedTextUpdate;
-        }
-
-        @Override
-        public String toString() {
-            return "InternalActionEndState(selStart=" + selectionStart + ", selEnd=" + selectionEnd
-                    + ", compStart" + compositionStart + ", compEnd=" + compositionEnd
-                    + ", updateReceived=" + (selectionUpdateTime > 0) + ")";
-        }
-    }
-    private static class ReloadedSelectionPositionState extends SelectionPositionState {
-        ReloadedSelectionPositionState(final int selectionStart, final int selectionEnd) {
-            super(selectionStart, selectionEnd);
-        }
-
-        @Override
-        public String toString() {
-            return "ReloadedSelectionPositionState(selStart=" + selectionStart
-                    + ", selEnd=" + selectionEnd + ")";
-        }
-    }
-    private static abstract class UpdatePositionState extends SelectionPositionState {
-        final Boolean appearsUpToDate;
-        final boolean selectionTaken;
-        UpdatePositionState(final int selectionStart, final int selectionEnd,
-                            final Boolean appearsUpToDate, final boolean selectionTaken) {
-            super(selectionStart, selectionEnd);
-            this.appearsUpToDate = appearsUpToDate;
-            this.selectionTaken = selectionTaken;
-        }
-    }
-    //TODO: (EW) since we flag InternalActionEndState with the update that matches, these are
-    // fundamentally unexpected updates. maybe rename
-    // actually these may also contain updates that aren't entirely unexpected, but simply that we
-    // didn't know where some positions were going to be.
-    private static class SelectionUpdateState extends UpdatePositionState {
-        final int compositionStart;
-        final int compositionEnd;
-        final boolean expectedSelectionAlreadyMatched;
-        boolean updateFullyTaken;
-        SelectionUpdateState(final int selectionStart, final int selectionEnd,
-                             final int compositionStart, final int compositionEnd,
-                             final Boolean appearsUpToDate,
-                             final boolean expectedSelectionAlreadyMatched,
-                             final boolean selectionTaken) {
-            super(selectionStart, selectionEnd, appearsUpToDate, selectionTaken);
-            this.compositionStart = compositionStart;
-            this.compositionEnd = compositionEnd;
-            this.expectedSelectionAlreadyMatched = expectedSelectionAlreadyMatched;
-        }
-
-        @Override
-        public String toString() {
-            return "SelectionUpdateState(selStart=" + selectionStart + ", selEnd=" + selectionEnd
-                    + ", compStart" + compositionStart + ", compEnd=" + compositionEnd
-                    + ", appearsUpToDate=" + appearsUpToDate
-                    + ", expectedMatched=" + expectedSelectionAlreadyMatched
-                    + ", selectionTaken=" + selectionTaken
-                    + ", updateFullyTaken=" + updateFullyTaken + ")";
-        }
-    }
-    private static class ExtractedTextUpdateState extends UpdatePositionState {
-        boolean textUpdateTaken;
-        ExtractedTextUpdateState(final int selectionStart, final int selectionEnd,
-                                 final Boolean appearsUpToDate, final boolean selectionTaken) {
-            super(selectionStart, selectionEnd, appearsUpToDate, selectionTaken);
-        }
-
-        @Override
-        public String toString() {
-            return "ExtractedTextUpdateState(selStart=" + selectionStart
-                    + ", selEnd=" + selectionEnd + ", appearsUpToDate=" + appearsUpToDate + ")";
         }
     }
 

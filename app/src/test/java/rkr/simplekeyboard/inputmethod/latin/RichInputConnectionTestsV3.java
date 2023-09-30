@@ -4023,8 +4023,11 @@ public class RichInputConnectionTestsV3 {
             // this action is from the IME, but it won't look the same as what we expected because
             // of the unexpected action before it that sent the update late. this update is
             // technically out-of-date but due to the last action changing, based on the cursor
-            // position, this looks up-to-date as far as we can tell..
+            // position, this looks up-to-date as far as we can tell.
             //TODO: (EW) should we really have an assert for updating the composition when that is technically incorrect?
+            //TODO: (EW) should we force the fully updated handler trigger to only happen from the
+            // timer so that cases like this that aren't actually up-to-date but simply look like it
+            // don't trigger inappropriately?
             testCase.processNextUpdate(true, new ProcessUpdateVerifier()
                     .verifySelectionUpdated(true)
                     .verifyIsExpected(false)
@@ -4043,27 +4046,29 @@ public class RichInputConnectionTestsV3 {
 
             // send the update for action 3
             // this action is from the IME, but it won't look the same as what we expected because
-            // of the unexpected action before it that sent the update late. reloading the cursor
-            // position should indicate this is an out-to-date update but we already updated to the
-            // current position.
+            // of the unexpected action before it that sent the update late. since the last update
+            // looked up-to-date (although it wasn't actually), we won't be expecting an update, so
+            // this will be taken blindly, assuming it is from some external action.
             testCase.processNextUpdate(true, new ProcessUpdateVerifier()
                     .verifySelectionUpdated(false)
-                    .verifyIsExpected(false)
-                    .verifyStateReloaded(true)
-                    .verifySelectionPositionIsCurrent());
+                    .verifyIsExpected(false));
             //TODO: (EW) skipping the assert for now (see above)
 
             // send the update for action 4
-            // we should be able to see that the last update was unexpected and out-of-date but we
-            // (previously) did update to the current state. reloading the cursor position should
-            // indicate this is probably an up-to-date update that also matches our expected
-            // selection state, so we can update the composition to match this update.
+            // since we're still not expecting updates due to the update that looked up-to-date,
+            // we'll continue to take the update, assuming it is more up-to-date than our current
+            // state, even if the update isn't necessarily up-to-date. alternatively, if we do
+            // validate all updates for being up-to-date, we should be able to see that the last
+            // update was unexpected and out-of-date but we (previously) did update to the current
+            // state, and reloading the cursor position should indicate this is probably an
+            // up-to-date update that also matches our expected selection state, so we can update
+            // the composition to match this update.
             testCase.processNextUpdate(true, new ProcessUpdateVerifier()
                     .verifySelectionUpdated(true)
                     .verifyIsExpected(false)
-                    .verifyStateReloaded(true)
                     .verifySelectionPositionIsCurrent()
-                    .verifyCompositionPositionIsCurrent());
+                    .verifyCompositionPositionIsCurrent()
+                    .verifyTextCacheIsCurrent());
 
             return testCase;
         }
@@ -8523,11 +8528,14 @@ public class RichInputConnectionTestsV3 {
 
         public <T extends Action> void finishAction(final ActionTestCase<T> testCase) {
             if (testCase.useBatch) {
+                System.out.println("finishAction: ending batch edit");
                 richInputConnection.endBatchEdit();
             } else {
                 // force the update selection call in case the input connection happened to skip the
                 // call (likely because the selection didn't change) to ensure we can verify whether
                 // the current state is expected
+                //TODO: (EW) this seems potentially invalid to do
+                System.out.println("finishAction: forcing update selection call");
                 fakeInputConnection.forceUpdateSelectionCall();
             }
             processPendingMessages();
