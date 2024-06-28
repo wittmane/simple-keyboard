@@ -80,6 +80,7 @@ public final class SubtypeLocaleUtils {
     private static final String LOCALE_KAZAKH = "kk";
     private static final String LOCALE_KHMER_CAMBODIA = "km_KH";
     private static final String LOCALE_KANNADA_INDIA = "kn_IN";
+    private static final String LOCALE_KOREAN = "ko";
     private static final String LOCALE_KYRGYZ = "ky";
     private static final String LOCALE_LAO_LAOS = "lo_LA";
     private static final String LOCALE_LITHUANIAN = "lt";
@@ -158,6 +159,7 @@ public final class SubtypeLocaleUtils {
             LOCALE_KAZAKH,
             LOCALE_KHMER_CAMBODIA,
             LOCALE_KANNADA_INDIA,
+            LOCALE_KOREAN,
             LOCALE_KYRGYZ,
             LOCALE_LAO_LAOS,
             LOCALE_LITHUANIAN,
@@ -221,6 +223,9 @@ public final class SubtypeLocaleUtils {
     public static final String LAYOUT_HINDI_COMPACT = "hindi_compact";
     public static final String LAYOUT_KANNADA = "kannada";
     public static final String LAYOUT_KHMER = "khmer";
+    public static final String LAYOUT_KOREAN_SHORT_VOWEL = "korean_short_vowel";
+    public static final String LAYOUT_KOREAN_TEN_KEY = "korean_ten_key";
+    public static final String LAYOUT_KOREAN_TWO_BULSIK = "korean_two_bulsik";
     public static final String LAYOUT_LAO = "lao";
     public static final String LAYOUT_MACEDONIAN = "macedonian";
     public static final String LAYOUT_MALAYALAM = "malayalam";
@@ -484,6 +489,11 @@ public final class SubtypeLocaleUtils {
                     break;
                 case LOCALE_KANNADA_INDIA:
                     addLayout(LAYOUT_KANNADA);
+                    break;
+                case LOCALE_KOREAN:
+                    addLayout(LAYOUT_KOREAN_TWO_BULSIK, R.string.subtype_two_bulsik);
+                    addLayout(LAYOUT_KOREAN_SHORT_VOWEL, R.string.subtype_short_vowel);
+                    addLayout(LAYOUT_KOREAN_TEN_KEY, R.string.subtype_ten_key);
                     break;
                 case LOCALE_LAO_LAOS:
                     addLayout(LAYOUT_LAO);

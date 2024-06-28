@@ -1,0 +1,143 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Copyright (C) 2024 Eli Wittman
+
+     Licensed under the Apache License, Version 2.0 (the "License");
+     you may not use this file except in compliance with the License.
+     You may obtain a copy of the License at
+
+          http://www.apache.org/licenses/LICENSE-2.0
+
+     Unless required by applicable law or agreed to in writing, software
+     distributed under the License is distributed on an "AS IS" BASIS,
+     WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+     See the License for the specific language governing permissions and
+     limitations under the License.
+-->
+<merge xmlns:latin="http://schemas.android.com/apk/res-auto">
+    <switch>
+        <case latin:showExtraChars="true">
+            <Key
+                latin:keyStyle="mieum"
+                latin:keyHintLabel="\@"
+                latin:additionalMoreKeys="\@" />
+            <Key
+                latin:keyStyle="nieun"
+                latin:keyHintLabel="#"
+                latin:additionalMoreKeys="#" />
+            <Key
+                latin:keyStyle="ieung"
+                latin:keyHintLabel="$"
+                latin:additionalMoreKeys="$" />
+            <Key
+                latin:keyStyle="rieul"
+                latin:keyHintLabel="&amp;"
+                latin:additionalMoreKeys="&amp;" />
+            <Key
+                latin:keyStyle="hieuh"
+                latin:keyHintLabel="("
+                latin:additionalMoreKeys="(" />
+            <switch>
+                <case latin:keyboardLayoutSetElement="alphabetManualShifted|alphabetShiftLocked|alphabetShiftLockShifted">
+                    <Key
+                        latin:keyStyle="yeo"
+                        latin:keyHintLabel=")"
+                        latin:additionalMoreKeys=")" />
+                </case>
+                <default>
+                    <!-- U+3155: "ㅕ" HANGUL LETTER YEO -->
+                    <Key
+                        latin:keyStyle="eo"
+                        latin:keyHintLabel=")"
+                        latin:additionalMoreKeys="),&#x3155;" />
+                </default>
+            </switch>
+        </case>
+        <default>
+            <Key
+                latin:keyStyle="mieum" />
+            <Key
+                latin:keyStyle="nieun" />
+            <Key
+                latin:keyStyle="ieung" />
+            <Key
+                latin:keyStyle="rieul" />
+            <Key
+                latin:keyStyle="hieuh" />
+            <switch>
+                <case latin:keyboardLayoutSetElement="alphabetManualShifted|alphabetShiftLocked|alphabetShiftLockShifted">
+                    <Key
+                        latin:keyStyle="yeo" />
+                </case>
+                <default>
+                    <!-- U+3155: "ㅕ" HANGUL LETTER YEO -->
+                    <Key
+                        latin:keyStyle="eo"
+                        latin:additionalMoreKeys="&#x3155;" />
+                </default>
+            </switch>
+        </default>
+    </switch>
+    <switch>
+        <case
+            latin:showExtraChars="true"
+            latin:showNumberRow="true">
+            <switch>
+                <case latin:keyboardLayoutSetElement="alphabetManualShifted|alphabetShiftLocked|alphabetShiftLockShifted">
+                    <Key
+                        latin:keyStyle="ya"
+                        latin:keyHintLabel="-"
+                        latin:additionalMoreKeys="-" />
+                </case>
+                <default>
+                    <!-- U+3151: "ㅑ" HANGUL LETTER YA -->
+                    <Key
+                        latin:keyStyle="a"
+                        latin:keyHintLabel="-"
+                        latin:additionalMoreKeys="-,&#x3151;" />
+                </default>
+            </switch>
+            <Key
+                latin:keyStyle="i"
+                latin:keyHintLabel="+"
+                latin:additionalMoreKeys="+" />
+        </case>
+        <case
+            latin:showNumberRow="true">
+            <switch>
+                <case latin:keyboardLayoutSetElement="alphabetManualShifted|alphabetShiftLocked|alphabetShiftLockShifted">
+                    <Key
+                        latin:keyStyle="ya" />
+                </case>
+                <default>
+                    <!-- U+3151: "ㅑ" HANGUL LETTER YA -->
+                    <Key
+                        latin:keyStyle="a"
+                        latin:additionalMoreKeys="&#x3151;" />
+                </default>
+            </switch>
+            <Key
+                latin:keyStyle="i" />
+        </case>
+        <default>
+            <switch>
+                <case latin:keyboardLayoutSetElement="alphabetManualShifted|alphabetShiftLocked|alphabetShiftLockShifted">
+                    <Key
+                        latin:keyStyle="ya"
+                        latin:keyHintLabel="9"
+                        latin:additionalMoreKeys="9" />
+                </case>
+                <default>
+                    <!-- U+3151: "ㅑ" HANGUL LETTER YA -->
+                    <Key
+                        latin:keyStyle="a"
+                        latin:keyHintLabel="9"
+                        latin:additionalMoreKeys="9,&#x3151;" />
+                </default>
+            </switch>
+            <Key
+                latin:keyStyle="i"
+                latin:keyHintLabel="0"
+                latin:additionalMoreKeys="0" />
+        </default>
+    </switch>
+</merge>

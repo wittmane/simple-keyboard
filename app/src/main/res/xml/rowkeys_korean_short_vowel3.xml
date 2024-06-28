@@ -1,0 +1,80 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Copyright (C) 2024 Eli Wittman
+
+     Licensed under the Apache License, Version 2.0 (the "License");
+     you may not use this file except in compliance with the License.
+     You may obtain a copy of the License at
+
+          http://www.apache.org/licenses/LICENSE-2.0
+
+     Unless required by applicable law or agreed to in writing, software
+     distributed under the License is distributed on an "AS IS" BASIS,
+     WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+     See the License for the specific language governing permissions and
+     limitations under the License.
+-->
+<merge xmlns:latin="http://schemas.android.com/apk/res-auto">
+    <switch>
+        <case latin:showExtraChars="true">
+            <Key
+                latin:keyStyle="khieukh"
+                latin:keyHintLabel="&quot;"
+                latin:additionalMoreKeys="&quot;" />
+            <Key
+                latin:keyStyle="thieuth"
+                latin:keyHintLabel="&apos;"
+                latin:additionalMoreKeys="&apos;" />
+            <Key
+                latin:keyStyle="chieuch"
+                latin:keyHintLabel=":"
+                latin:additionalMoreKeys=":" />
+            <Key
+                latin:keyStyle="phieuph"
+                latin:keyHintLabel=";"
+                latin:additionalMoreKeys=";" />
+            <switch>
+                <case latin:keyboardLayoutSetElement="alphabetManualShifted|alphabetShiftLocked|alphabetShiftLockShifted">
+                    <Key
+                        latin:keyStyle="yu"
+                        latin:keyHintLabel="!"
+                        latin:additionalMoreKeys="!" />
+                </case>
+                <default>
+                    <!-- U+3160: "ㅠ" HANGUL LETTER YU -->
+                    <Key
+                        latin:keyStyle="u"
+                        latin:keyHintLabel="!"
+                        latin:additionalMoreKeys="!,&#x3160;" />
+                </default>
+            </switch>
+            <Key
+                latin:keyStyle="eu"
+                latin:keyHintLabel="\?"
+                latin:additionalMoreKeys="\?" />
+        </case>
+        <default>
+            <Key
+                latin:keyStyle="khieukh" />
+            <Key
+                latin:keyStyle="thieuth" />
+            <Key
+                latin:keyStyle="chieuch" />
+            <Key
+                latin:keyStyle="phieuph" />
+            <switch>
+                <case latin:keyboardLayoutSetElement="alphabetManualShifted|alphabetShiftLocked|alphabetShiftLockShifted">
+                    <Key
+                        latin:keyStyle="yu" />
+                </case>
+                <default>
+                    <!-- U+3160: "ㅠ" HANGUL LETTER YU -->
+                    <Key
+                        latin:keyStyle="u"
+                        latin:additionalMoreKeys="&#x3160;" />
+                </default>
+            </switch>
+            <Key
+                latin:keyStyle="eu" />
+        </default>
+    </switch>
+</merge>

@@ -1,0 +1,209 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Copyright (C) 2024 Eli Wittman
+
+     Licensed under the Apache License, Version 2.0 (the "License");
+     you may not use this file except in compliance with the License.
+     You may obtain a copy of the License at
+
+          http://www.apache.org/licenses/LICENSE-2.0
+
+     Unless required by applicable law or agreed to in writing, software
+     distributed under the License is distributed on an "AS IS" BASIS,
+     WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+     See the License for the specific language governing permissions and
+     limitations under the License.
+-->
+<merge xmlns:latin="http://schemas.android.com/apk/res-auto">
+    <switch>
+        <case
+            latin:showExtraChars="true"
+            latin:showNumberRow="true">
+            <switch>
+                <case latin:keyboardLayoutSetElement="alphabetManualShifted|alphabetShiftLocked|alphabetShiftLockShifted">
+                    <Key
+                        latin:keyStyle="ssangPieup"
+                        latin:keyHintLabel="_"
+                        latin:additionalMoreKeys="_" />
+                    <Key
+                        latin:keyStyle="ssangCieuc"
+                        latin:keyHintLabel="\\"
+                        latin:additionalMoreKeys="\\\\" />
+                    <Key
+                        latin:keyStyle="ssangTikeut"
+                        latin:keyHintLabel="|"
+                        latin:additionalMoreKeys="\\|" />
+                    <Key
+                        latin:keyStyle="ssangKiyeok"
+                        latin:keyHintLabel="="
+                        latin:additionalMoreKeys="=" />
+                    <Key
+                        latin:keyStyle="ssangSios"
+                        latin:keyHintLabel="["
+                        latin:additionalMoreKeys="!text/keyspec_left_square_bracket" />
+                    <Key
+                        latin:keyStyle="yo"
+                        latin:keyHintLabel="]"
+                        latin:additionalMoreKeys="!text/keyspec_right_square_bracket" />
+                    <Key
+                        latin:keyStyle="yae"
+                        latin:keyHintLabel="%"
+                        latin:additionalMoreKeys="%" />
+                    <Key
+                        latin:keyStyle="ye"
+                        latin:keyHintLabel="/"
+                        latin:additionalMoreKeys="/" />
+                </case>
+                <default>
+                    <Key
+                        latin:keyStyle="pieup"
+                        latin:keyHintLabel="_"
+                        latin:additionalMoreKeys="_" />
+                    <Key
+                        latin:keyStyle="cieuc"
+                        latin:keyHintLabel="\\"
+                        latin:additionalMoreKeys="\\\\" />
+                    <Key
+                        latin:keyStyle="tikeut"
+                        latin:keyHintLabel="|"
+                        latin:additionalMoreKeys="\\|" />
+                    <Key
+                        latin:keyStyle="kiyeok"
+                        latin:keyHintLabel="="
+                        latin:additionalMoreKeys="=" />
+                    <Key
+                        latin:keyStyle="sios"
+                        latin:keyHintLabel="["
+                        latin:additionalMoreKeys="!text/keyspec_left_square_bracket" />
+                    <!-- U+315B: "ㅛ" HANGUL LETTER YO -->
+                    <Key
+                        latin:keyStyle="o"
+                        latin:keyHintLabel="]"
+                        latin:additionalMoreKeys="!text/keyspec_right_square_bracket,&#x315B;" />
+                    <Key
+                        latin:keyStyle="ae"
+                        latin:keyHintLabel="%"
+                        latin:additionalMoreKeys="%" />
+                    <Key
+                        latin:keyStyle="e"
+                        latin:keyHintLabel="/"
+                        latin:additionalMoreKeys="/" />
+                </default>
+            </switch>
+        </case>
+        <case latin:showNumberRow="true">
+            <switch>
+                <case latin:keyboardLayoutSetElement="alphabetManualShifted|alphabetShiftLocked|alphabetShiftLockShifted">
+                    <Key
+                        latin:keyStyle="ssangPieup" />
+                    <Key
+                        latin:keyStyle="ssangCieuc" />
+                    <Key
+                        latin:keyStyle="ssangTikeut" />
+                    <Key
+                        latin:keyStyle="ssangKiyeok" />
+                    <Key
+                        latin:keyStyle="ssangSios" />
+                    <Key
+                        latin:keyStyle="yo" />
+                    <Key
+                        latin:keyStyle="yae" />
+                    <Key
+                        latin:keyStyle="ye" />
+                </case>
+                <default>
+                    <Key
+                        latin:keyStyle="pieup" />
+                    <Key
+                        latin:keyStyle="cieuc" />
+                    <Key
+                        latin:keyStyle="tikeut" />
+                    <Key
+                        latin:keyStyle="kiyeok" />
+                    <Key
+                        latin:keyStyle="sios" />
+                    <!-- U+315B: "ㅛ" HANGUL LETTER YO -->
+                    <Key
+                        latin:keyStyle="o"
+                        latin:additionalMoreKeys="&#x315B;" />
+                    <Key
+                        latin:keyStyle="ae" />
+                    <Key
+                        latin:keyStyle="e" />
+                </default>
+            </switch>
+        </case>
+        <default>
+            <switch>
+                <case latin:keyboardLayoutSetElement="alphabetManualShifted|alphabetShiftLocked|alphabetShiftLockShifted">
+                    <Key
+                        latin:keyStyle="ssangPieup"
+                        latin:keyHintLabel="1"
+                        latin:additionalMoreKeys="1" />
+                    <Key
+                        latin:keyStyle="ssangCieuc"
+                        latin:keyHintLabel="2"
+                        latin:additionalMoreKeys="2" />
+                    <Key
+                        latin:keyStyle="ssangTikeut"
+                        latin:keyHintLabel="3"
+                        latin:additionalMoreKeys="3" />
+                    <Key
+                        latin:keyStyle="ssangKiyeok"
+                        latin:keyHintLabel="4"
+                        latin:additionalMoreKeys="4" />
+                    <Key
+                        latin:keyStyle="ssangSios"
+                        latin:keyHintLabel="5"
+                        latin:additionalMoreKeys="5" />
+                    <Key
+                        latin:keyStyle="yo"
+                        latin:keyHintLabel="6"
+                        latin:additionalMoreKeys="6" />
+                    <Key
+                        latin:keyStyle="yae"
+                        latin:keyHintLabel="7"
+                        latin:additionalMoreKeys="7" />
+                    <Key
+                        latin:keyStyle="ye"
+                        latin:keyHintLabel="8"
+                        latin:additionalMoreKeys="8" />
+                </case>
+                <default>
+                    <Key
+                        latin:keyStyle="pieup"
+                        latin:keyHintLabel="1"
+                        latin:additionalMoreKeys="1" />
+                    <Key
+                        latin:keyStyle="cieuc"
+                        latin:keyHintLabel="2"
+                        latin:additionalMoreKeys="2" />
+                    <Key
+                        latin:keyStyle="tikeut"
+                        latin:keyHintLabel="3"
+                        latin:additionalMoreKeys="3" />
+                    <Key
+                        latin:keyStyle="kiyeok"
+                        latin:keyHintLabel="4"
+                        latin:additionalMoreKeys="4" />
+                    <Key
+                        latin:keyStyle="sios"
+                        latin:keyHintLabel="5"
+                        latin:additionalMoreKeys="5" />
+                    <!-- U+315B: "ㅛ" HANGUL LETTER YO -->
+                    <Key
+                        latin:keyStyle="o"
+                        latin:keyHintLabel="6"
+                        latin:additionalMoreKeys="6,&#x315B;" />
+                    <Key
+                        latin:keyStyle="ae"
+                        latin:keyHintLabel="7"
+                        latin:additionalMoreKeys="7" />
+                    <Key
+                        latin:keyStyle="e"
+                        latin:keyHintLabel="8"
+                        latin:additionalMoreKeys="8" />
+                </default>
+            </switch>
+        </default>
+    </switch>
+</merge>

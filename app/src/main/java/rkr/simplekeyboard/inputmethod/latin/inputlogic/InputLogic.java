@@ -397,6 +397,9 @@ public final class InputLogic {
             case SubtypeLocaleUtils.LAYOUT_HINDI_COMPACT:
             case SubtypeLocaleUtils.LAYOUT_KANNADA:
             case SubtypeLocaleUtils.LAYOUT_KHMER:
+            case SubtypeLocaleUtils.LAYOUT_KOREAN_TWO_BULSIK:
+            case SubtypeLocaleUtils.LAYOUT_KOREAN_SHORT_VOWEL:
+            case SubtypeLocaleUtils.LAYOUT_KOREAN_TEN_KEY:
             case SubtypeLocaleUtils.LAYOUT_LAO:
             case SubtypeLocaleUtils.LAYOUT_MALAYALAM:
             case SubtypeLocaleUtils.LAYOUT_MARATHI:
