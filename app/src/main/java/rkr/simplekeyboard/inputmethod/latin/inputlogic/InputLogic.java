@@ -17,6 +17,7 @@
 package rkr.simplekeyboard.inputmethod.latin.inputlogic;
 
 import android.os.SystemClock;
+import android.text.InputType;
 import android.text.TextUtils;
 import android.view.KeyCharacterMap;
 import android.view.KeyEvent;
@@ -28,6 +29,7 @@ import rkr.simplekeyboard.inputmethod.event.Event;
 import rkr.simplekeyboard.inputmethod.event.InputTransaction;
 import rkr.simplekeyboard.inputmethod.latin.LatinIME;
 import rkr.simplekeyboard.inputmethod.latin.RichInputConnection;
+import rkr.simplekeyboard.inputmethod.latin.Subtype;
 import rkr.simplekeyboard.inputmethod.latin.common.Constants;
 import rkr.simplekeyboard.inputmethod.latin.common.StringUtils;
 import rkr.simplekeyboard.inputmethod.latin.settings.SettingsValues;
@@ -46,6 +48,8 @@ public final class InputLogic {
     public final RichInputConnection mConnection;
     private final RecapitalizeStatus mRecapitalizeStatus = new RecapitalizeStatus();
 
+    private ComposingText mComposingText;
+
     public final TreeSet<Long> mCurrentlyPressedHardwareKeys = new TreeSet<>();
 
     /**
@@ -62,17 +66,24 @@ public final class InputLogic {
      * Initializes the input logic for input in an editor.
      *
      * Call this when input starts or restarts in some editor (typically, in onStartInputView).
+     * @param subtype the current subtype.
      */
-    public void startInput() {
+    public void startInput(final Subtype subtype) {
         mRecapitalizeStatus.disable(); // Do not perform recapitalize until the cursor is moved once
         mCurrentlyPressedHardwareKeys.clear();
+        mComposingText = null;
     }
 
     /**
      * Call this when the subtype changes.
+     * @param subtype the new subtype.
      */
-    public void onSubtypeChanged() {
-        startInput();
+    public void onSubtypeChanged(final Subtype subtype) {
+        if (mComposingText != null && !mComposingText.isEmpty()) {
+            mComposingText.clear();
+            mConnection.finishComposingText();
+        }
+        startInput(subtype);
     }
 
     /**
@@ -89,10 +100,36 @@ public final class InputLogic {
         final String rawText = event.getTextToCommit().toString();
         final InputTransaction inputTransaction = new InputTransaction(settingsValues);
         final String text = performSpecificTldProcessingOnTextInput(rawText);
-        mConnection.commitText(text, 1);
+        if (mComposingText != null) {
+            updateComposingText(mComposingText.addString(text));
+        } else {
+            mConnection.commitText(text, 1);
+        }
         // Space state must be updated before calling updateShiftState
         inputTransaction.requireShiftUpdate(InputTransaction.SHIFT_UPDATE_NOW);
         return inputTransaction;
+    }
+
+    /**
+     * Update the composing text, which optionally includes committing some text that should no
+     * longer be included in the composing text.
+     * @param completedText completed text from the composition that should be committed before the
+     *                      updated composing text.
+     */
+    private void updateComposingText(final String completedText) {
+        boolean textUpdated = false;
+        if (!TextUtils.isEmpty(completedText)) {
+            mConnection.commitText(completedText, 1);
+            textUpdated = true;
+        }
+        final String composingText = mComposingText.toString();
+        if (!TextUtils.isEmpty(composingText)) {
+            mConnection.setComposingText(composingText, 1);
+            textUpdated = true;
+        }
+        if (!textUpdated) {
+            mConnection.setComposingText("", 1);
+        }
     }
 
     /**
@@ -101,10 +138,21 @@ public final class InputLogic {
      * do the necessary adjustments.
      * @param newSelStart new selection start
      * @param newSelEnd new selection end
+     * @param composingSpanStart composition start
+     * @param composingSpanEnd composition end
      * @return whether the cursor has moved as a result of user interaction.
      */
-    public boolean onUpdateSelection(final int newSelStart, final int newSelEnd) {
+    public boolean onUpdateSelection(final int newSelStart, final int newSelEnd,
+                                     final int composingSpanStart, final int composingSpanEnd) {
         resetEntireInputState(newSelStart, newSelEnd);
+
+        // currently we only support composing text when the cursor is at the end of the composing
+        // text, so stop composing if that's not the case
+        if (mComposingText != null && !mComposingText.isEmpty() && (newSelStart != newSelEnd
+                || newSelStart != Math.max(composingSpanStart, composingSpanEnd))) {
+            mComposingText.clear();
+            mConnection.finishComposingText();
+        }
 
         // The cursor has been moved : we now accept to perform recapitalization
         mRecapitalizeStatus.enable();
@@ -157,6 +205,10 @@ public final class InputLogic {
         if (!TextUtils.isEmpty(textToCommit)) {
             mConnection.commitText(textToCommit, 1);
         }
+        //TODO: (EW) how should composing be handled here? should this be added to the composition,
+        // should the composition be finished, or should this replace the composing text?
+        // is this ever even used?
+        // LatinIME set the composing text
     }
 
     /**
@@ -314,7 +366,16 @@ public final class InputLogic {
                 ? InputTransaction.SHIFT_UPDATE_LATER : InputTransaction.SHIFT_UPDATE_NOW;
         inputTransaction.requireShiftUpdate(shiftUpdateKind);
 
-        sendDownUpKeyEvent(KeyEvent.KEYCODE_DEL);
+        if (mComposingText == null || mComposingText.isEmpty()) {
+            sendDownUpKeyEvent(KeyEvent.KEYCODE_DEL);
+        } else {
+            // since we currently only support composing when the cursor is at the end of the
+            // composition, if we have a composition, that should mean the cursor is at the normal
+            // position to do the regular backspace for the composition (or we didn't receive the
+            // update for the cursor position change)
+            mComposingText.backspace();
+            updateComposingText(null);
+        }
     }
 
     /**
@@ -501,6 +562,18 @@ public final class InputLogic {
     }
 
     public void sendDownUpKeyEvent(final int keyCode, final int metaState) {
+        //TODO: (EW) handle other key codes for the composing text. probably need to steal the text
+        // from the key and use for composing directly since we're not going to be updating based on
+        // what actually happens in the text field.
+        if (keyCode == KeyEvent.KEYCODE_DEL && mComposingText != null
+                && !mComposingText.isEmpty()) {
+            if (mConnection.hasCursorPosition() && !mConnection.hasSelection()) {
+                // since there isn't a selection, just do a regular backspace on the composition
+                mComposingText.backspace();
+                updateComposingText(null);
+                return;
+            }
+        }
         final long eventTime = SystemClock.uptimeMillis();
         mConnection.sendKeyEvent(new KeyEvent(eventTime, eventTime,
                 KeyEvent.ACTION_DOWN, keyCode, 0, metaState, KeyCharacterMap.VIRTUAL_KEYBOARD, 0,
@@ -520,6 +593,24 @@ public final class InputLogic {
      */
     // TODO: replace these two parameters with an InputTransaction
     private void sendKeyCodePoint(final int codePoint) {
+        if (mComposingText != null) {
+            String completedText = mComposingText.addCodePoint(codePoint);
+            final boolean addNewCodePointSeparately;
+            //TODO: (EW) try to clean this up. it isn't super clear that addNewCodePointSeparately
+            // is only true when there isn't going to be a composition
+            if (!TextUtils.isEmpty(completedText) && mComposingText.isEmpty()
+                    && completedText.codePointAt(completedText.codePointCount(0, completedText.length()) - 1) == codePoint
+                    && codePoint >= '0' && codePoint <= '9') {
+                addNewCodePointSeparately = true;
+                completedText = completedText.substring(0, completedText.length() - 1);
+            } else {
+                addNewCodePointSeparately = false;
+            }
+            updateComposingText(completedText);
+            if (!addNewCodePointSeparately) {
+                return;
+            }
+        }
         // TODO: Remove this special handling of digit letters.
         // For backward compatibility. See {@link InputMethodService#sendKeyChar(char)}.
         if (codePoint >= '0' && codePoint <= '9') {

@@ -86,6 +86,13 @@ public final class RichInputConnection {
      * text, if any. It is refreshed when the cursor moves by calling upon the TextView.
      */
     private final StringBuilder mCommittedTextBeforeComposingText = new StringBuilder();
+    /**
+     * This contains the currently composing text, as simple keyboard thinks the TextView is seeing
+     * it.
+     */
+    private final StringBuilder mComposingText = new StringBuilder();
+
+    private int mInputType;
 
     /**
      * This variable is a temporary object used in {@link #commitText(CharSequence,int)}
@@ -116,7 +123,8 @@ public final class RichInputConnection {
         final ExtractedText et = mIC.getExtractedText(r, 0);
         final CharSequence beforeCursor = getTextBeforeCursor(Constants.EDITOR_CONTENTS_CACHE_SIZE,
                 0);
-        final StringBuilder internal = new StringBuilder(mCommittedTextBeforeComposingText);
+        final StringBuilder internal = new StringBuilder(mCommittedTextBeforeComposingText)
+                .append(mComposingText);
         if (null == et || null == beforeCursor) return;
         final int actualLength = Math.min(beforeCursor.length(), internal.length());
         if (internal.length() > actualLength) {
@@ -162,6 +170,14 @@ public final class RichInputConnection {
         if (DEBUG_PREVIOUS_TEXT) checkConsistencyForDebug();
     }
 
+    public void setInputType(int inputType) {
+        mInputType = inputType;
+    }
+
+    public int getInputType() {
+        return mInputType;
+    }
+
     /**
      * Reset the cached text and retrieve it again from the editor.
      *
@@ -181,6 +197,7 @@ public final class RichInputConnection {
             final int newSelEnd) {
         mExpectedSelStart = newSelStart;
         mExpectedSelEnd = newSelEnd;
+        mComposingText.setLength(0);
         final boolean didReloadTextSuccessfully = reloadTextCache();
         if (!didReloadTextSuccessfully) {
             Log.d(TAG, "Will try to retrieve text later.");
@@ -224,6 +241,19 @@ public final class RichInputConnection {
         }
     }
 
+    public void finishComposingText() {
+        if (DEBUG_BATCH_NESTING) checkBatchEdit();
+        if (DEBUG_PREVIOUS_TEXT) checkConsistencyForDebug();
+        // TODO: this is not correct! The cursor is not necessarily after the composing text.
+        // In the practice right now this is only called when input ends so it will be reset so
+        // it works, but it's wrong and should be fixed.
+        mCommittedTextBeforeComposingText.append(mComposingText);
+        mComposingText.setLength(0);
+        if (isConnected()) {
+            mIC.finishComposingText();
+        }
+    }
+
     /**
      * Calls {@link InputConnection#commitText(CharSequence, int)}.
      *
@@ -239,9 +269,10 @@ public final class RichInputConnection {
         // middle of the composing word mComposingText only holds the part of the composing text
         // that is before the cursor, so this actually works, but it's terribly confusing. Fix this.
         if (hasCursorPosition()) {
-            mExpectedSelStart += text.length();
+            mExpectedSelStart += text.length() - mComposingText.length();
             mExpectedSelEnd = mExpectedSelStart;
         }
+        mComposingText.setLength(0);
         if (isConnected()) {
             mTempObjectForCommitText.clear();
             mTempObjectForCommitText.append(text);
@@ -295,6 +326,10 @@ public final class RichInputConnection {
         if (!isConnected()) {
             return Constants.TextUtils.CAP_MODE_OFF;
         }
+        if (!TextUtils.isEmpty(mComposingText)) {
+            // We have some composing text - we should be in MODE_CHARACTERS only.
+            return TextUtils.CAP_MODE_CHARACTERS & inputType;
+        }
         // TODO: this will generally work, but there may be cases where the buffer contains SOME
         // information but not enough to determine the caps mode accurately. This may happen after
         // heavy pressing of delete, for example DEFAULT_TEXT_CACHE_SIZE - 5 times or so.
@@ -321,7 +356,8 @@ public final class RichInputConnection {
     }
 
     public CharSequence getTextBeforeCursor(final int n, final int flags) {
-        final int cachedLength = mCommittedTextBeforeComposingText.length();
+        final int cachedLength =
+                mCommittedTextBeforeComposingText.length() + mComposingText.length();
         // If we have enough characters to satisfy the request, or if we have all characters in
         // the text field, then we can return the cached version right away.
         // However, if we don't have an expected cursor position, then we should always
@@ -337,6 +373,7 @@ public final class RichInputConnection {
             // so we call #toString() on it. That will result in the return value being strictly
             // speaking wrong, but since this is used for basing bigram probability off, and
             // it's only going to matter for one getSuggestions call, it's fine in the practice.
+            s.append(mComposingText.toString());
             if (s.length() > n) {
                 s.delete(0, s.length() - n);
             }
@@ -391,6 +428,7 @@ public final class RichInputConnection {
         mIC.setComposingRegion(startPosition, endPosition);
         mIC.setComposingText(text, startPosition);
         mIC.finishComposingText();
+        mComposingText.setLength(0);
     }
 
     public void performEditorAction(final int actionId) {
@@ -419,10 +457,14 @@ public final class RichInputConnection {
                 }
                 break;
             case KeyEvent.KEYCODE_DEL:
-                if (mCommittedTextBeforeComposingText.length() > 0) {
-                    mCommittedTextBeforeComposingText.delete(
-                            mCommittedTextBeforeComposingText.length() - 1,
-                            mCommittedTextBeforeComposingText.length());
+                if (0 == mComposingText.length()) {
+                    if (mCommittedTextBeforeComposingText.length() > 0) {
+                        mCommittedTextBeforeComposingText.delete(
+                                mCommittedTextBeforeComposingText.length() - 1,
+                                mCommittedTextBeforeComposingText.length());
+                    }
+                } else {
+                    mComposingText.delete(mComposingText.length() - 1, mComposingText.length());
                 }
 
                 if (mExpectedSelStart > 0 && mExpectedSelStart == mExpectedSelEnd) {
@@ -453,6 +495,21 @@ public final class RichInputConnection {
         if (isConnected()) {
             mIC.sendKeyEvent(keyEvent);
         }
+    }
+
+    public void setComposingText(final CharSequence text, final int newCursorPosition) {
+        if (DEBUG_BATCH_NESTING) checkBatchEdit();
+        if (DEBUG_PREVIOUS_TEXT) checkConsistencyForDebug();
+        mExpectedSelStart += text.length() - mComposingText.length();
+        mExpectedSelEnd = mExpectedSelStart;
+        mComposingText.setLength(0);
+        mComposingText.append(text);
+        // TODO: support values of newCursorPosition != 1. At this time, this is never called with
+        // newCursorPosition != 1.
+        if (isConnected()) {
+            mIC.setComposingText(text, newCursorPosition);
+        }
+        if (DEBUG_PREVIOUS_TEXT) checkConsistencyForDebug();
     }
 
     /**

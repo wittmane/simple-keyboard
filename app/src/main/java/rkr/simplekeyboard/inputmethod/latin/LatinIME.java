@@ -390,7 +390,7 @@ public class LatinIME extends InputMethodService implements KeyboardActionListen
 
     @Override
     public void onCurrentSubtypeChanged() {
-        mInputLogic.onSubtypeChanged();
+        mInputLogic.onSubtypeChanged(mRichImm.getCurrentSubtype());
         loadKeyboard();
     }
 
@@ -465,7 +465,8 @@ public class LatinIME extends InputMethodService implements KeyboardActionListen
             // span, so we should reset our state unconditionally, even if restarting is true.
             // We also tell the input logic about the combining rules for the current subtype, so
             // it can adjust its combiners if needed.
-            mInputLogic.startInput();
+            mInputLogic.mConnection.setInputType(editorInfo.inputType);
+            mInputLogic.startInput(mRichImm.getCurrentSubtype());
 
             // TODO[IL]: Can the following be moved to InputLogic#startInput?
             if (!mInputLogic.mConnection.resetCachesUponCursorMoveAndReturnSuccess(
@@ -567,7 +568,8 @@ public class LatinIME extends InputMethodService implements KeyboardActionListen
         // view is not displayed we have no means of showing suggestions anyway, and if it is then
         // we want to show suggestions anyway.
         if (isInputViewShown()
-                && mInputLogic.onUpdateSelection(newSelStart, newSelEnd)) {
+                && mInputLogic.onUpdateSelection(newSelStart, newSelEnd,
+                        composingSpanStart, composingSpanEnd)) {
             mKeyboardSwitcher.requestUpdatingShiftState(getCurrentAutoCapsState(),
                     getCurrentRecapitalizeState());
         }
