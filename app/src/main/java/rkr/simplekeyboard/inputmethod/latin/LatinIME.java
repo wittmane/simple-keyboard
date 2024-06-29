@@ -775,7 +775,7 @@ public class LatinIME extends InputMethodService implements KeyboardActionListen
     // Implementation of {@link KeyboardActionListener}.
     @Override
     public void onCodeInput(final int codePoint, final int x, final int y,
-            final boolean isKeyRepeat) {
+            final boolean isKeyRepeat, final boolean isDoubleTap) {
         // TODO: this processing does not belong inside LatinIME, the caller should be doing this.
         final MainKeyboardView mainKeyboardView = mKeyboardSwitcher.getMainKeyboardView();
         // x and y include some padding, but everything down the line (especially native
@@ -786,7 +786,7 @@ public class LatinIME extends InputMethodService implements KeyboardActionListen
         final int keyX = mainKeyboardView.getKeyX(x);
         final int keyY = mainKeyboardView.getKeyY(y);
         final Event event = createSoftwareKeypressEvent(getCodePointForKeyboard(codePoint),
-                keyX, keyY, isKeyRepeat);
+                keyX, keyY, isKeyRepeat, isDoubleTap);
         onEvent(event);
     }
 
@@ -803,7 +803,7 @@ public class LatinIME extends InputMethodService implements KeyboardActionListen
     // squashed into the same variable, and this method should be removed.
     // public for testing, as we don't want to copy the same logic into test code
     public static Event createSoftwareKeypressEvent(final int keyCodeOrCodePoint, final int keyX,
-             final int keyY, final boolean isKeyRepeat) {
+             final int keyY, final boolean isKeyRepeat, final boolean isDoubleTap) {
         final int keyCode;
         final int codePoint;
         if (keyCodeOrCodePoint <= 0) {
@@ -813,7 +813,8 @@ public class LatinIME extends InputMethodService implements KeyboardActionListen
             keyCode = Event.NOT_A_KEY_CODE;
             codePoint = keyCodeOrCodePoint;
         }
-        return Event.createSoftwareKeypressEvent(codePoint, keyCode, keyX, keyY, isKeyRepeat);
+        return Event.createSoftwareKeypressEvent(codePoint, keyCode, keyX, keyY, isKeyRepeat,
+                isDoubleTap);
     }
 
     // Called from PointerTracker through the KeyboardActionListener interface

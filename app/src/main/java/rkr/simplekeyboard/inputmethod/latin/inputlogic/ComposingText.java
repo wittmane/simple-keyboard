@@ -29,9 +29,12 @@ public interface ComposingText {
     /**
      * Add a code point to the composing text.
      * @param codePoint the new code point to add.
+     * @param isDoubleTap whether the code point was added as a double tap, which could allow the
+     *                    last added code point to be modified instead of adding this code point
+     *                    separately.
      * @return the completed text if the entered code point requires starting a separate composition.
      */
-    String addCodePoint(final int codePoint);
+    String addCodePoint(final int codePoint, final boolean isDoubleTap);
 
     /**
      * Add a string to the composing text.

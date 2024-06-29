@@ -63,6 +63,8 @@ public class Event {
     final private static int FLAG_REPEAT = 0x2;
     // This event has already been consumed.
     final private static int FLAG_CONSUMED = 0x4;
+    // This event is for a repeated key tap
+    final private static int FLAG_DOUBLE_TAP = 0x8;
 
     final private int mEventType; // The type of event - one of the constants above
     // The code point associated with the event, if relevant. This is a unicode code point, and
@@ -96,8 +98,7 @@ public class Event {
 
     // This method is private - to create a new event, use one of the create* utility methods.
     private Event(final int type, final CharSequence text, final int codePoint, final int keyCode,
-            final int x, final int y, final int flags,
-            final Event next) {
+            final int x, final int y, final int flags, final Event next) {
         mEventType = type;
         mText = text;
         mCodePoint = codePoint;
@@ -109,9 +110,16 @@ public class Event {
     }
 
     public static Event createSoftwareKeypressEvent(final int codePoint, final int keyCode,
-            final int x, final int y, final boolean isKeyRepeat) {
+            final int x, final int y, final boolean isKeyRepeat, final boolean isDoubleTap) {
+        int flag = FLAG_NONE;
+        if (isKeyRepeat) {
+            flag |= FLAG_REPEAT;
+        }
+        if (isDoubleTap) {
+            flag |= FLAG_DOUBLE_TAP;
+        }
         return new Event(EVENT_TYPE_INPUT_KEYPRESS, null, codePoint, keyCode, x, y,
-                isKeyRepeat ? FLAG_REPEAT : FLAG_NONE, null);
+                flag, null);
     }
 
     /**
@@ -137,6 +145,10 @@ public class Event {
 
     public boolean isKeyRepeat() {
         return 0 != (FLAG_REPEAT & mFlags);
+    }
+
+    public boolean isDoubleTap() {
+        return 0 != (FLAG_DOUBLE_TAP & mFlags);
     }
 
     public boolean isConsumed() { return 0 != (FLAG_CONSUMED & mFlags); }

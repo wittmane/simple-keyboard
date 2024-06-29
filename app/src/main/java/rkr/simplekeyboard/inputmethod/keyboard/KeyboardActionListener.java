@@ -52,10 +52,13 @@ public interface KeyboardActionListener {
      *            {@link PointerTracker} or so, the value should be
      *            {@link Constants#NOT_A_COORDINATE}.If it's called on insertion from the
      *            suggestion strip, it should be {@link Constants#SUGGESTION_STRIP_COORDINATE}.
-     * @param isKeyRepeat true if this is a key repeat, false otherwise
+     * @param isKeyRepeat true if this was triggered by holding a key to have it repeatedly send the
+     *                    same code, false otherwise
+     * @param isDoubleTap true if this key has been pressed within a timeout of the last press
+     *                    without other keys being pressed
      */
     // TODO: change this to send an Event object instead
-    void onCodeInput(int primaryCode, int x, int y, boolean isKeyRepeat);
+    void onCodeInput(int primaryCode, int x, int y, boolean isKeyRepeat, boolean isDoubleTap);
 
     /**
      * Sends a string of characters to the listener.
@@ -86,7 +89,8 @@ public interface KeyboardActionListener {
         @Override
         public void onReleaseKey(int primaryCode, boolean withSliding) {}
         @Override
-        public void onCodeInput(int primaryCode, int x, int y, boolean isKeyRepeat) {}
+        public void onCodeInput(int primaryCode, int x, int y, boolean isKeyRepeat,
+                                boolean isDoubleTap) {}
         @Override
         public void onTextInput(String text) {}
         @Override

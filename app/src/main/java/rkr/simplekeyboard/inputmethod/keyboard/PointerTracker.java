@@ -100,6 +100,10 @@ public final class PointerTracker implements PointerTrackerQueue.Element {
     private long mStartTime;
     private boolean mCursorMoved = false;
 
+    // Tracker for tapping the same key multiple times in a row
+    private Key mExtraTapKey = null;
+    private int mExtraTapCount = 0;
+
     // true if keyboard layout has been changed.
     private boolean mKeyboardLayoutHasBeenChanged;
 
@@ -220,6 +224,13 @@ public final class PointerTracker implements PointerTrackerQueue.Element {
         final boolean ignoreModifierKey = mIsInDraggingFinger && key.isModifier();
         final boolean altersCode = key.altCodeWhileTyping() && sTimerProxy.isTypingState();
         final int code = altersCode ? key.getAltCode() : primaryCode;
+        final boolean isDoubleTap;
+        if (altersCode) {
+            isDoubleTap = false;
+            clearExtraTapKey();
+        } else {
+            isDoubleTap = !altersCode && getExtraTapCount(key) > 0;
+        }
         if (DEBUG_LISTENER) {
             final String output = code == Constants.CODE_OUTPUT_TEXT
                     ? key.getOutputText() : Constants.printableCode(code);
@@ -235,7 +246,8 @@ public final class PointerTracker implements PointerTrackerQueue.Element {
             sListener.onTextInput(key.getOutputText());
         } else if (code != Constants.CODE_UNSPECIFIED) {
             sListener.onCodeInput(code,
-                Constants.NOT_A_COORDINATE, Constants.NOT_A_COORDINATE, isKeyRepeat);
+                    Constants.NOT_A_COORDINATE, Constants.NOT_A_COORDINATE,
+                    isKeyRepeat, isDoubleTap);
         }
     }
 
@@ -501,12 +513,15 @@ public final class PointerTracker implements PointerTrackerQueue.Element {
                 key = onDownKey(x, y);
             }
 
+            handleExtraTapPress(key);
             startRepeatKey(key);
             startLongPressTimer(key);
             setPressedKeyGraphics(key);
             mStartX = x;
             //mStartY = y;
             mStartTime = System.currentTimeMillis();
+        } else {
+            clearExtraTapKey();
         }
     }
 
@@ -552,12 +567,14 @@ public final class PointerTracker implements PointerTrackerQueue.Element {
         if (mIsTrackingForActionDisabled) {
             return;
         }
+        handleExtraTapPress(key);
         startLongPressTimer(key);
         setPressedKeyGraphics(key);
     }
 
     private void processDraggingFingerOutFromOldKey(final Key oldKey) {
         setReleasedKeyGraphics(oldKey, true /* withAnimation */);
+        clearExtraTapKey();
         callListenerOnRelease(oldKey, oldKey.getCode(), true /* withSliding */);
         startKeySelectionByDraggingFinger(oldKey);
         sTimerProxy.cancelKeyTimersOf(this);
@@ -615,6 +632,7 @@ public final class PointerTracker implements PointerTrackerQueue.Element {
                 mStartX += steps * sPointerStep;
                 sListener.onMovePointer(steps);
             }
+            clearExtraTapKey();
             return;
         }
 
@@ -627,6 +645,7 @@ public final class PointerTracker implements PointerTrackerQueue.Element {
                 mStartX += steps * sPointerStep;
                 sListener.onMoveDeletePointer(steps);
             }
+            clearExtraTapKey();
             return;
         }
 
@@ -687,6 +706,8 @@ public final class PointerTracker implements PointerTrackerQueue.Element {
         // Release the last pressed key.
         setReleasedKeyGraphics(currentKey, true /* withAnimation */);
 
+        handleExtraTapRelease(currentKey);
+
         if(mCursorMoved && currentKey.getCode() == Constants.CODE_DELETE) {
             sListener.onUpWithDeletePointerActive();
         }
@@ -739,11 +760,13 @@ public final class PointerTracker implements PointerTrackerQueue.Element {
             return;
         }
         if (key.hasNoPanelAutoMoreKey()) {
+            clearExtraTapKey();
             cancelKeyTracking();
             final int moreKeyCode = key.getMoreKeys()[0].mCode;
-            sListener.onPressKey(moreKeyCode, 0 /* repeatCont */, true /* isSinglePointer */);
+            final boolean isDoubleTap = getExtraTapCount(key) > 0;
+            sListener.onPressKey(moreKeyCode, 0 /* repeatCount */, true /* isSinglePointer */);
             sListener.onCodeInput(moreKeyCode, Constants.NOT_A_COORDINATE,
-                    Constants.NOT_A_COORDINATE, false /* isKeyRepeat */);
+                    Constants.NOT_A_COORDINATE, false /* isKeyRepeat */, isDoubleTap);
             sListener.onReleaseKey(moreKeyCode, false /* withSliding */);
             return;
         }
@@ -751,6 +774,7 @@ public final class PointerTracker implements PointerTrackerQueue.Element {
         if (code == Constants.CODE_SPACE || code == Constants.CODE_LANGUAGE_SWITCH) {
             // Long pressing the space key invokes IME switcher dialog.
             if (sListener.onCustomRequest(Constants.CUSTOM_CODE_SHOW_INPUT_METHOD_PICKER)) {
+                clearExtraTapKey();
                 cancelKeyTracking();
                 sListener.onReleaseKey(code, false /* withSliding */);
                 return;
@@ -762,6 +786,7 @@ public final class PointerTracker implements PointerTrackerQueue.Element {
         if (moreKeysPanel == null) {
             return;
         }
+        clearExtraTapKey();
         final int translatedX = moreKeysPanel.translateX(mLastX);
         final int translatedY = moreKeysPanel.translateY(mLastY);
         moreKeysPanel.onDownEvent(translatedX, translatedY, mPointerId);
@@ -871,6 +896,40 @@ public final class PointerTracker implements PointerTrackerQueue.Element {
         callListenerOnRelease(key, code, false /* withSliding */);
     }
 
+    /* package */ void handleExtraTapPress(final Key key) {
+        if (mExtraTapKey != null && mExtraTapKey.equals(key)
+                && sTimerProxy.isInExtraTapKeyTimeout()) {
+            mExtraTapCount++;
+        } else {
+            mExtraTapKey = key;
+            mExtraTapCount = 0;
+        }
+    }
+
+    /* package */ void handleExtraTapRelease(final Key key) {
+        if (mExtraTapKey == null) {
+            return;
+        }
+        if (!mExtraTapKey.equals(key)) {
+            clearExtraTapKey();
+        } else {
+            sTimerProxy.startExtraTapKeyTimer();
+        }
+    }
+
+    /* package */ void clearExtraTapKey() {
+        mExtraTapKey = null;
+        mExtraTapCount = 0;
+        sTimerProxy.cancelExtraTapKeyTimer();
+    }
+
+    /* package */ int getExtraTapCount(final Key key) {
+        if (mExtraTapKey != null && mExtraTapKey.equals(key)) {
+            return mExtraTapCount;
+        }
+        return 0;
+    }
+
     private void startRepeatKey(final Key key) {
         if (key == null) return;
         if (!key.isRepeatable()) return;
@@ -887,6 +946,7 @@ public final class PointerTracker implements PointerTrackerQueue.Element {
             return;
         }
         mCurrentRepeatingKeyCode = code;
+        clearExtraTapKey();
         final int nextRepeatCount = repeatCount + 1;
         startKeyRepeatTimer(nextRepeatCount);
         callListenerOnPressAndCheckKeyboardLayoutChange(key, repeatCount);

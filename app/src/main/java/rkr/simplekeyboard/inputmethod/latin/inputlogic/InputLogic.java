@@ -334,7 +334,7 @@ public final class InputLogic {
      * @param event The event to handle.
      */
     private void handleNonSeparatorEvent(final Event event) {
-        sendKeyCodePoint(event.mCodePoint);
+        sendKeyCodePoint(event.mCodePoint, event.isDoubleTap());
     }
 
     /**
@@ -343,7 +343,7 @@ public final class InputLogic {
      * @param inputTransaction The transaction in progress.
      */
     private void handleSeparatorEvent(final Event event, final InputTransaction inputTransaction) {
-        sendKeyCodePoint(event.mCodePoint);
+        sendKeyCodePoint(event.mCodePoint, event.isDoubleTap());
 
         inputTransaction.requireShiftUpdate(InputTransaction.SHIFT_UPDATE_NOW);
     }
@@ -590,11 +590,13 @@ public final class InputLogic {
      * compatibility is a concern for example) where we want to use deprecated methods.
      *
      * @param codePoint the code point to send.
+     * @param isDoubleTap true if this key has been pressed within a timeout of the last press
+     *                    without other keys being pressed.
      */
     // TODO: replace these two parameters with an InputTransaction
-    private void sendKeyCodePoint(final int codePoint) {
+    private void sendKeyCodePoint(final int codePoint, final boolean isDoubleTap) {
         if (mComposingText != null) {
-            String completedText = mComposingText.addCodePoint(codePoint);
+            String completedText = mComposingText.addCodePoint(codePoint, isDoubleTap);
             final boolean addNewCodePointSeparately;
             //TODO: (EW) try to clean this up. it isn't super clear that addNewCodePointSeparately
             // is only true when there isn't going to be a composition

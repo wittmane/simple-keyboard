@@ -34,6 +34,7 @@ public final class TimerHandler extends LeakGuardHandlerWrapper<DrawingProxy>
     private static final int MSG_UPDATE_BATCH_INPUT = 5;
     private static final int MSG_DISMISS_KEY_PREVIEW = 6;
     private static final int MSG_DISMISS_GESTURE_FLOATING_PREVIEW_TEXT = 7;
+    private static final int MSG_EXTRA_TAP_KEY = 8;
 
     private final int mIgnoreAltCodeKeyTimeout;
 
@@ -167,6 +168,22 @@ public final class TimerHandler extends LeakGuardHandlerWrapper<DrawingProxy>
     @Override
     public boolean isInDoubleTapShiftKeyTimeout() {
         return hasMessages(MSG_DOUBLE_TAP_SHIFT_KEY);
+    }
+
+    @Override
+    public void startExtraTapKeyTimer() {
+        sendMessageDelayed(obtainMessage(MSG_EXTRA_TAP_KEY),
+                ViewConfiguration.getDoubleTapTimeout());
+    }
+
+    @Override
+    public void cancelExtraTapKeyTimer() {
+        removeMessages(MSG_EXTRA_TAP_KEY);
+    }
+
+    @Override
+    public boolean isInExtraTapKeyTimeout() {
+        return hasMessages(MSG_EXTRA_TAP_KEY);
     }
 
     @Override

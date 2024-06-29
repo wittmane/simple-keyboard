@@ -112,6 +112,8 @@ public class MoreKeysKeyboardView extends KeyboardView implements MoreKeysPanel 
     public void onDownEvent(final int x, final int y, final int pointerId) {
         mActivePointerId = pointerId;
         mCurrentKey = detectKey(x, y);
+        PointerTracker pointerTracker = PointerTracker.getPointerTracker(pointerId);
+        pointerTracker.handleExtraTapPress(mCurrentKey);
     }
 
     @Override
@@ -119,11 +121,17 @@ public class MoreKeysKeyboardView extends KeyboardView implements MoreKeysPanel 
         if (mActivePointerId != pointerId) {
             return;
         }
-        final boolean hasOldKey = (mCurrentKey != null);
+        final Key oldKey = mCurrentKey;
         mCurrentKey = detectKey(x, y);
-        if (hasOldKey && mCurrentKey == null) {
-            // A more keys keyboard is canceled when detecting no key.
-            mController.onCancelMoreKeysPanel();
+        if (oldKey != null) {
+            if (mCurrentKey == null) {
+                // A more keys keyboard is canceled when detecting no key.
+                mController.onCancelMoreKeysPanel();
+            }
+            if (!oldKey.equals(mCurrentKey)) {
+                PointerTracker pointerTracker = PointerTracker.getPointerTracker(pointerId);
+                pointerTracker.clearExtraTapKey();
+            }
         }
     }
 
@@ -139,6 +147,9 @@ public class MoreKeysKeyboardView extends KeyboardView implements MoreKeysPanel 
             updateReleaseKeyGraphics(mCurrentKey);
             onKeyInput(mCurrentKey);
             mCurrentKey = null;
+        } else {
+            PointerTracker pointerTracker = PointerTracker.getPointerTracker(pointerId);
+            pointerTracker.clearExtraTapKey();
         }
     }
 
@@ -147,10 +158,14 @@ public class MoreKeysKeyboardView extends KeyboardView implements MoreKeysPanel 
      */
     protected void onKeyInput(final Key key) {
         final int code = key.getCode();
+        PointerTracker pointerTracker = PointerTracker.getPointerTracker(mActivePointerId);
+        final boolean isDoubleTap = pointerTracker.getExtraTapCount(key) > 0;
+        pointerTracker.handleExtraTapRelease(key);
         if (code == Constants.CODE_OUTPUT_TEXT) {
             mListener.onTextInput(mCurrentKey.getOutputText());
         } else if (code != Constants.CODE_UNSPECIFIED) {
-            mListener.onCodeInput(code, Constants.NOT_A_COORDINATE, Constants.NOT_A_COORDINATE, false /* isKeyRepeat */);
+            mListener.onCodeInput(code, Constants.NOT_A_COORDINATE, Constants.NOT_A_COORDINATE,
+                    false /* isKeyRepeat */, isDoubleTap);
         }
     }
 

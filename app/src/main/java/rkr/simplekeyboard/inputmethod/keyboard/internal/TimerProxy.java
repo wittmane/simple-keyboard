@@ -83,6 +83,22 @@ public interface TimerProxy {
     boolean isInDoubleTapShiftKeyTimeout();
 
     /**
+     * Start a timer to detect tapping a key multiple times in a row.
+     */
+    void startExtraTapKeyTimer();
+
+    /**
+     * Cancel a timer of detecting tapping a key multiple times in a row.
+     */
+    void cancelExtraTapKeyTimer();
+
+    /**
+     * Check if a timer of detecting tapping a key multiple times in a row is running.
+     * @return true if detecting tapping a key multiple times in a row is on going.
+     */
+    boolean isInExtraTapKeyTimeout();
+
+    /**
      * Cancel a timer of firing updating batch input.
      * @param tracker the {@link PointerTracker} that resumes moving or ends gesture input.
      */
