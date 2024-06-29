@@ -32,6 +32,7 @@ import rkr.simplekeyboard.inputmethod.latin.RichInputConnection;
 import rkr.simplekeyboard.inputmethod.latin.Subtype;
 import rkr.simplekeyboard.inputmethod.latin.common.Constants;
 import rkr.simplekeyboard.inputmethod.latin.common.StringUtils;
+import rkr.simplekeyboard.inputmethod.latin.inputlogic.korean.HangulComposingText;
 import rkr.simplekeyboard.inputmethod.latin.settings.SettingsValues;
 import rkr.simplekeyboard.inputmethod.latin.utils.InputTypeUtils;
 import rkr.simplekeyboard.inputmethod.latin.utils.RecapitalizeStatus;
@@ -71,7 +72,22 @@ public final class InputLogic {
     public void startInput(final Subtype subtype) {
         mRecapitalizeStatus.disable(); // Do not perform recapitalize until the cursor is moved once
         mCurrentlyPressedHardwareKeys.clear();
-        mComposingText = null;
+        final String language = subtype.getLocaleObject().getLanguage();
+        if (mConnection.getInputType() == InputType.TYPE_NULL) {
+            // an input type of null indicates that the input connection isn't rich (can't support
+            // things like composing text and retrieving text) and although some may have support
+            // for composing on various levels (such as tracking an invisible composition) the
+            // behavior is likely going to be unpredictable, so it's probably best to not bother
+            // trying to compose text in these fields.
+            mComposingText = null;
+        } else if (language.equals("ko")) {
+            final HangulComposingText hangulComposingText = new HangulComposingText();
+            //TODO: (EW) probably make this part of the constructor
+            hangulComposingText.setKeyboardLayout(subtype.getKeyboardLayoutSet());
+            mComposingText = hangulComposingText;
+        } else {
+            mComposingText = null;
+        }
     }
 
     /**
