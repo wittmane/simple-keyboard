@@ -73,7 +73,7 @@ public final class InputLogic {
         mRecapitalizeStatus.disable(); // Do not perform recapitalize until the cursor is moved once
         mCurrentlyPressedHardwareKeys.clear();
         final String language = subtype.getLocaleObject().getLanguage();
-        if (mConnection.getInputType() == InputType.TYPE_NULL) {
+        if ((mConnection.getInputType() & InputType.TYPE_MASK_CLASS) == InputType.TYPE_NULL) {
             // an input type of null indicates that the input connection isn't rich (can't support
             // things like composing text and retrieving text) and although some may have support
             // for composing on various levels (such as tracking an invisible composition) the
